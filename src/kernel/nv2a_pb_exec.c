@@ -25,6 +25,7 @@
  * <prefix>NNN.bmp, so the result can be looked at without a display.
  */
 #include <math.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -380,8 +381,11 @@ static float reg_f(uint32_t method)
 }
 
 /* Where BACK_END_WRITE_SEMAPHORE_RELEASE lands; see nv2a_backend.h. */
-static uint32_t s_sem_va;
-void nv2a_pb_set_semaphore_target(uint32_t guest_va) { s_sem_va = guest_va; }
+static atomic_uint s_sem_va;
+void nv2a_pb_set_semaphore_target(uint32_t guest_va)
+{
+    atomic_store_explicit(&s_sem_va, guest_va, memory_order_release);
+}
 
 /* Unhandled methods, ranked. The interesting output is not that something was
  * skipped but which things dominate, because that is the order to implement
@@ -4175,12 +4179,14 @@ int nv2a_pb_exec_constant_word(uint32_t method, uint32_t param)
 
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
+    uint32_t sem_va = atomic_load_explicit(&s_sem_va, memory_order_acquire);
+
     /* BACK_END_WRITE_SEMAPHORE_RELEASE. The title's pointer already names the
      * semaphore word; SET_SEMAPHORE_OFFSET is not added (in X-Men Legends it
      * held 0xFF000000 at times, which put the write outside guest memory). */
-    if (subch == 0 && method == 0x1D70 && s_sem_va) {
+    if (subch == 0 && method == 0x1D70 && sem_va) {
         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
-        *(volatile uint32_t *)(mem + s_sem_va) = param;
+        *(volatile uint32_t *)(mem + sem_va) = param;
         return;
     }
     if (!s_exec_inited) {
@@ -4271,7 +4277,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
         if (!r)
             return;
-        if (!s_sem_va) {
+        if (!atomic_load_explicit(&s_sem_va, memory_order_acquire)) {
             uint32_t va = xbox_Nv2aFenceWordVa();
 
             if (va) {

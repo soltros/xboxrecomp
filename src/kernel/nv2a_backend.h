@@ -124,7 +124,9 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
  * what lets D3D's fence waits and ring-space checks see real progress.
  *
  * ponytail: the title supplies the address instead of the executor resolving
- * the semaphore context DMA object through RAMIN. */
+ * the semaphore context DMA object through RAMIN. The target is published
+ * atomically, so a project may register it after the title creates its D3D
+ * device while the executor is already polling. */
 void nv2a_pb_set_semaphore_target(uint32_t guest_va);
 
 #endif /* NV2A_BACKEND_H */

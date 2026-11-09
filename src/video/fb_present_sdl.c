@@ -27,7 +27,9 @@
  * surface directly, as the GDI window does, for a title that never flips.
  *
  * Closing the window ends the process: the window owns the main thread, and
- * lifted code cannot be stopped mid-flight. atexit handlers still run.
+ * lifted code and its kernel workers cannot be stopped mid-flight. Use an
+ * immediate process exit so host atexit cleanup cannot free devices that the
+ * still-running guest may touch while shutdown is in progress.
  *
  * Knobs: RECOMP_PRESENT_VSYNC=0 presents without waiting for the display;
  * RECOMP_WINDOW_SCALE=<n> sizes the window (default 2);
@@ -445,6 +447,14 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     fflush(stdout);
     fflush(stderr);
 
+    /* The guest and its kernel workers are still live when the user closes the
+     * window. Running atexit cleanup here races them: e.g. APU shutdown can
+     * unpublish the MMIO model while a guest thread is still touching it. The
+     * operating system will reclaim SDL, audio and guest resources as the
+     * process exits, so bypass host cleanup on this path. */
+    if (quit)
+        _Exit(0);
+
     /* Window and renderer go first, on this thread as AppKit wants. SDL_Quit
      * is only safe once nothing else uses SDL: the USB and guest threads read
      * the game controllers, so with one open SDL stays up and exit()
@@ -458,8 +468,6 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         SDL_Quit();
     else
         SDL_QuitSubSystem(FBWIN_SDL_SUBSYSTEMS);
-    if (quit)
-        exit(0);
     return s_guest_rc;
 }
 

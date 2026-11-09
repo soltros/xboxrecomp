@@ -167,6 +167,7 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
     PLARGE_INTEGER Interval)
 {
     DWORD ms;
+    static volatile LONG cap_reported = 0;
 
     (void)WaitMode;
 
@@ -194,6 +195,29 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
         if (diff <= 0)
             return STATUS_SUCCESS; /* Already past */
         ms = (DWORD)(diff / 10000);
+    }
+
+    /* Bring-up probe for titles that pass an accidental near-INFINITE
+     * relative delay and then stop before rendering gameplay. Xbox semantics
+     * remain unchanged unless the host explicitly opts in. */
+    {
+        static volatile LONG cached_cap = -1;
+        LONG cap = InterlockedCompareExchange(&cached_cap, -1, -1);
+        if (cap < 0) {
+            const char *value = getenv("RECOMP_DELAY_CAP_MS");
+            unsigned long parsed = value ? strtoul(value, NULL, 0) : 0;
+            LONG desired = parsed > 0 && parsed <= 0x7FFFFFFFul
+                         ? (LONG)parsed : 0;
+            InterlockedCompareExchange(&cached_cap, desired, -1);
+            cap = InterlockedCompareExchange(&cached_cap, -1, -1);
+        }
+        if (cap > 0 && ms > (DWORD)cap) {
+            if (InterlockedCompareExchange(&cap_reported, 1, 0) == 0)
+                fprintf(stderr, "[KERNEL] KeDelayExecutionThread: capping "
+                        "%lu ms to %d ms (RECOMP_DELAY_CAP_MS)\n",
+                        (unsigned long)ms, (int)cap);
+            ms = (DWORD)cap;
+        }
     }
 
     if (Alertable) {

@@ -527,6 +527,14 @@ static inline int32_t recomp_cvt_si32(double value, uint32_t mxcsr, int truncate
 
 /** Ring buffer of recent indirect call target VAs. */
 extern volatile uint32_t g_icall_trace[ICALL_TRACE_SIZE];
+extern volatile uint32_t g_icall_context_enabled;
+/** Guest return VA for each indirect call target in the same ring slot. */
+extern volatile uint32_t g_icall_site_trace[ICALL_TRACE_SIZE];
+/** Register and first two stack arguments at each indirect call entry. */
+extern volatile uint32_t g_icall_ecx_trace[ICALL_TRACE_SIZE];
+extern volatile uint32_t g_icall_edx_trace[ICALL_TRACE_SIZE];
+extern volatile uint32_t g_icall_arg0_trace[ICALL_TRACE_SIZE];
+extern volatile uint32_t g_icall_arg1_trace[ICALL_TRACE_SIZE];
 
 /** Current write index into the ring buffer. */
 extern volatile uint32_t g_icall_trace_idx;
@@ -1397,6 +1405,14 @@ void xbox_GuestCpuPreempt(uint32_t va);
 #define RECOMP_ICALL(xbox_va) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
+    if (g_icall_context_enabled) { \
+        uint32_t _slot = g_icall_trace_idx & (ICALL_TRACE_SIZE-1); \
+        g_icall_site_trace[_slot] = MEM32(g_esp); \
+        g_icall_ecx_trace[_slot] = ecx; \
+        g_icall_edx_trace[_slot] = edx; \
+        g_icall_arg0_trace[_slot] = MEM32(g_esp + 4); \
+        g_icall_arg1_trace[_slot] = MEM32(g_esp + 8); \
+    } \
     g_icall_trace_idx++; \
     g_icall_count++; \
     /* Skip garbage VAs outside code section + kernel thunk range */ \
@@ -1424,6 +1440,14 @@ void xbox_GuestCpuPreempt(uint32_t va);
 #define RECOMP_ICALL_SAFE(xbox_va, saved_esp) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
+    if (g_icall_context_enabled) { \
+        uint32_t _slot = g_icall_trace_idx & (ICALL_TRACE_SIZE-1); \
+        g_icall_site_trace[_slot] = MEM32(g_esp); \
+        g_icall_ecx_trace[_slot] = ecx; \
+        g_icall_edx_trace[_slot] = edx; \
+        g_icall_arg0_trace[_slot] = MEM32(g_esp + 4); \
+        g_icall_arg1_trace[_slot] = MEM32(g_esp + 8); \
+    } \
     g_icall_trace_idx++; \
     g_icall_count++; \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
@@ -1444,6 +1468,14 @@ void xbox_GuestCpuPreempt(uint32_t va);
     (void)(saved_esp); \
     uint32_t _va = (uint32_t)(xbox_va); \
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
+    if (g_icall_context_enabled) { \
+        uint32_t _slot = g_icall_trace_idx & (ICALL_TRACE_SIZE-1); \
+        g_icall_site_trace[_slot] = MEM32(g_esp); \
+        g_icall_ecx_trace[_slot] = ecx; \
+        g_icall_edx_trace[_slot] = edx; \
+        g_icall_arg0_trace[_slot] = MEM32(g_esp + 4); \
+        g_icall_arg1_trace[_slot] = MEM32(g_esp + 8); \
+    } \
     g_icall_trace_idx++; \
     g_icall_count++; \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
@@ -1470,6 +1502,14 @@ void xbox_GuestCpuPreempt(uint32_t va);
 #define RECOMP_ICALL_SAFE_AT(xbox_va, saved_esp, site) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
+    if (g_icall_context_enabled) { \
+        uint32_t _slot = g_icall_trace_idx & (ICALL_TRACE_SIZE-1); \
+        g_icall_site_trace[_slot] = MEM32(g_esp); \
+        g_icall_ecx_trace[_slot] = ecx; \
+        g_icall_edx_trace[_slot] = edx; \
+        g_icall_arg0_trace[_slot] = MEM32(g_esp + 4); \
+        g_icall_arg1_trace[_slot] = MEM32(g_esp + 8); \
+    } \
     g_icall_trace_idx++; \
     g_icall_count++; \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
@@ -1491,6 +1531,14 @@ void xbox_GuestCpuPreempt(uint32_t va);
     (void)(saved_esp); \
     uint32_t _va = (uint32_t)(xbox_va); \
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
+    if (g_icall_context_enabled) { \
+        uint32_t _slot = g_icall_trace_idx & (ICALL_TRACE_SIZE-1); \
+        g_icall_site_trace[_slot] = MEM32(g_esp); \
+        g_icall_ecx_trace[_slot] = ecx; \
+        g_icall_edx_trace[_slot] = edx; \
+        g_icall_arg0_trace[_slot] = MEM32(g_esp + 4); \
+        g_icall_arg1_trace[_slot] = MEM32(g_esp + 8); \
+    } \
     g_icall_trace_idx++; \
     g_icall_count++; \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \

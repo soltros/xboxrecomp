@@ -94,8 +94,32 @@ static int bridge_va_mapped(uint32_t va, uint32_t bytes)
         return 0;
     if (end <= mapped)
         return 1;
-    return va >= XBOX_CONTIG_BASE
-        && end <= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
+    if (va >= XBOX_CONTIG_BASE
+            && end <= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+        return 1;
+
+    /* The optional extended VMA is not one flat committed mapping. Validate
+     * every tracked region before a bridge lets the host read or write it;
+     * NtReadFile in particular writes directly into this range. */
+    if (guest_vmem_active() && va >= mapped && end <= GUEST_VMEM_TOP) {
+        uint64_t cursor = va;
+
+        while (cursor < end) {
+            uint32_t info[7];
+            uint64_t region_end;
+
+            if (!guest_vmem_query((uint32_t)cursor, info)
+                    || info[4] != 0x1000u /* MEM_COMMIT */
+                    || !info[3])
+                return 0;
+            region_end = (uint64_t)info[0] + info[3];
+            if (region_end <= cursor)
+                return 0;
+            cursor = region_end < end ? region_end : end;
+        }
+        return 1;
+    }
+    return 0;
 }
 
 /* STATUS_ACCESS_VIOLATION is what NT answers for a user buffer it cannot

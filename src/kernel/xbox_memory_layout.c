@@ -746,7 +746,8 @@ static void ac97_arm_write_trap(void)
     return;
 #endif
     g_ac97_page = (char *)g_mcpx_memory + AC97_NABM_OFFSET;
-#if !defined(_WIN32) && defined(__aarch64__)
+#if !defined(_WIN32) && (defined(__aarch64__) \
+        || (defined(__x86_64__) && defined(__linux__)))
     (void)old;
     g_ac97_hsize = (size_t)sysconf(_SC_PAGESIZE);
     if (g_ac97_hsize < AC97_TRAP_BYTES)
@@ -1724,6 +1725,12 @@ RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
  * every indirect call.
  */
 extern volatile uint32_t g_icall_trace[16];
+extern volatile uint32_t g_icall_context_enabled;
+extern volatile uint32_t g_icall_site_trace[16];
+extern volatile uint32_t g_icall_ecx_trace[16];
+extern volatile uint32_t g_icall_edx_trace[16];
+extern volatile uint32_t g_icall_arg0_trace[16];
+extern volatile uint32_t g_icall_arg1_trace[16];
 extern volatile uint32_t g_icall_trace_idx;
 
 void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
@@ -1867,6 +1874,12 @@ int recomp_guest_longjmp(uint32_t buf_va, uint32_t value)
  */
 /* Defined below, after the watchdog. */
 extern volatile uint32_t g_icall_trace[16];
+extern volatile uint32_t g_icall_context_enabled;
+extern volatile uint32_t g_icall_site_trace[16];
+extern volatile uint32_t g_icall_ecx_trace[16];
+extern volatile uint32_t g_icall_edx_trace[16];
+extern volatile uint32_t g_icall_arg0_trace[16];
+extern volatile uint32_t g_icall_arg1_trace[16];
 extern volatile uint32_t g_icall_trace_idx;
 extern volatile uint64_t g_icall_count;
 
@@ -2407,10 +2420,14 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
          * "same count at 20s and 60s" proves nothing about it. */
         fprintf(stderr, "  icalls so far: %llu\n",
                 (unsigned long long)g_icall_count);
-        fprintf(stderr, "  recent ICALL targets:");
-        for (k = 0; k < 16; k++)
-            fprintf(stderr, " %08X",
-                    g_icall_trace[(g_icall_trace_idx + k) & 15]);
+        fprintf(stderr, "  recent ICALL site->target (newest first):");
+        for (k = 1; k <= 16; k++) {
+            uint32_t slot = (g_icall_trace_idx - k) & 15;
+            fprintf(stderr, " %08X->%08X(ecx=%08X edx=%08X args=%08X,%08X)\n",
+                    g_icall_site_trace[slot], g_icall_trace[slot],
+                    g_icall_ecx_trace[slot], g_icall_edx_trace[slot],
+                    g_icall_arg0_trace[slot], g_icall_arg1_trace[slot]);
+        }
         fprintf(stderr, "\n");
     }
     /* Guest globals worth seeing at the moment of the hang.
@@ -2482,6 +2499,8 @@ void xbox_WatchdogStart(void)
     if (!s_watchdog_secs)
         return;
 
+    g_icall_context_enabled = 1;
+
     /* Taken on the guest thread: g_esp is thread-local, so the watchdog has to
      * be handed the address of the one that matters rather than reading its
      * own, which is always zero. */
@@ -2517,6 +2536,12 @@ RECOMP_TLS uint32_t g_eflags = 0x00000202u;
 
 /* ICALL trace ring buffer */
 volatile uint32_t g_icall_trace[16] = {0};
+volatile uint32_t g_icall_context_enabled = 0;
+volatile uint32_t g_icall_site_trace[16] = {0};
+volatile uint32_t g_icall_ecx_trace[16] = {0};
+volatile uint32_t g_icall_edx_trace[16] = {0};
+volatile uint32_t g_icall_arg0_trace[16] = {0};
+volatile uint32_t g_icall_arg1_trace[16] = {0};
 volatile uint32_t g_icall_trace_idx = 0;
 volatile uint64_t g_icall_count = 0;
 
