@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.20)
+project(mmio_decode_x86_64_test C)
+set(CMAKE_C_STANDARD 11)
+add_executable(mmio_decode_x86_64_test test_main.c)
+target_include_directories(mmio_decode_x86_64_test PRIVATE ../../src/platform)
+enable_testing()
+add_test(NAME mmio_decode_x86_64 COMMAND mmio_decode_x86_64_test)

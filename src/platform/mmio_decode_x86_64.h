@@ -15,7 +15,8 @@
  * decoded with its disp32, so its length is right too.
  *
  * Covered forms: MOV 88/89 8A/8B, MOV moffs A0-A3, MOVZX 0F B6/B7, MOVSX
- * 0F BE/BF, MOV r/m,imm C6/C7, MOVD/MOVQ 0F 6E/7E between XMM and r/m, and
+ * 0F BE/BF, MOV r/m,imm C6/C7, TEST r/m,imm F6/F7 /0 and /1, MOVD/MOVQ
+ * 0F 6E/7E between XMM and r/m, and
  * MOVUPS/MOVAPS 0F 10/11 (four dword accesses). Anything else returns 0 and
  * logs the faulting RIP plus the first eight opcode bytes once per unique
  * opcode -- stepping an instruction that was not understood corrupts the
@@ -96,6 +97,25 @@ static inline void mmio_x86_put_reg(mmio_ctx_t *uc, int reg, uint64_t v)
 static inline uint64_t mmio_x86_size_mask(int size)
 {
     return size >= 8 ? ~0ULL : (1ULL << (size * 8)) - 1;
+}
+
+/* TEST changes the condition flags but leaves its device operand untouched.
+ * Match the Windows decoder's tracked flags (CF, ZF, SF, OF); PF and AF are
+ * not consumed by the Xbox polling code and stay unchanged. */
+static inline void mmio_x86_test_flags(mmio_ctx_t *uc, uint64_t a,
+                                       uint64_t b, int size)
+{
+    const uint64_t mask = mmio_x86_size_mask(size);
+    const uint64_t sign = 1ULL << (size * 8 - 1);
+    uint64_t result = (a & b) & mask;
+    greg_t flags = uc->uc_mcontext.gregs[REG_EFL];
+
+    flags &= (greg_t)~(0x0001u | 0x0040u | 0x0080u | 0x0800u);
+    if (result == 0)
+        flags |= 0x0040u;
+    if (result & sign)
+        flags |= 0x0080u;
+    uc->uc_mcontext.gregs[REG_EFL] = flags;
 }
 
 /* Read a general register at an operand width. Without a REX prefix, byte
@@ -344,6 +364,25 @@ static inline int mmio_emulate_x86_64(mmio_ctx_t *uc, uint32_t off, void *dev,
             goto undecoded;
         imm = mmio_x86_imm(op + 1 + mlen, size, &ilen);
         wr(dev, off, imm & mmio_x86_size_mask(size), size);
+        MMIO_CTX_SET_PC(uc, MMIO_CTX_PC(uc) + prefix + 1 + mlen + ilen);
+        return 1;
+    }
+
+    case 0xF6:                                  /* TEST r/m8, imm8 */
+    case 0xF7: {                                /* TEST r/m, imm   */
+        int group = (op[1] >> 3) & 7;
+
+        if (group > 1)                          /* /1 aliases /0; rest differ */
+            goto undecoded;
+        if (op[0] == 0xF6)
+            size = 1;
+        mlen = mmio_x86_modrm(op + 1, rex_r, rex_b,
+                              &mod, &reg, &rm, &rip_rel);
+        if (mod == 3)
+            goto undecoded;
+        imm = mmio_x86_imm(op + 1 + mlen, size, &ilen);
+        v = rd(dev, off, size);
+        mmio_x86_test_flags(uc, v, imm, size);
         MMIO_CTX_SET_PC(uc, MMIO_CTX_PC(uc) + prefix + 1 + mlen + ilen);
         return 1;
     }
