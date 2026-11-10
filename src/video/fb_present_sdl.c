@@ -18,13 +18,12 @@
  * on the calling thread exactly as before.
  *
  * Frames come from the executor's flip (xbox_FramebufferWindowPresent, on
- * the executor's thread). The flip copies the finished surface into a free
- * slot of three and publishes it with an index swap under a mutex held for a
- * few instructions, so the executor never waits for the window and the
- * window never reads guest memory the rasteriser may be writing. The surface
- * format is the GDI window's: 640x480, bpp from pitch / 640, 2 = R5G6B5,
- * 4 = X8R8G8B8. Before the first flip the window reads the AvSetDisplayMode
- * surface directly, as the GDI window does, for a title that never flips.
+ * the executor's thread). The SDL renderer path copies the finished surface
+ * into a free slot of three and publishes it with an index swap. The optional
+ * RECOMP_GL_PRESENT path instead uses an OpenGL window; the NV2A backend owns
+ * its context on the guest thread and blits its render target directly before
+ * the flip notification. Before the first flip, only the SDL renderer path
+ * reads the AvSetDisplayMode surface directly.
  *
  * Closing the window ends the process: the window owns the main thread, and
  * lifted code and its kernel workers cannot be stopped mid-flight. Use an
@@ -77,6 +76,8 @@ static Uint32          s_frame_event;        /* wakes the main loop */
 static volatile int    s_wake_pending;
 static volatile int    s_in_present;         /* executor inside Present */
 static volatile uint32_t s_fb_va, s_fb_pitch; /* AvSetDisplayMode surface */
+static SDL_Window     *s_fb_window;
+static int              s_gl_present;
 
 /* Counted at the flip, read once a second for the title bar. */
 static uint64_t s_flips;
@@ -129,6 +130,26 @@ static void publish(uint32_t bpp)
     }
 }
 
+static void notify_direct_frame(void)
+{
+    pthread_mutex_lock(&s_lock);
+    s_ready_seq++;
+    pthread_mutex_unlock(&s_lock);
+    if (!__atomic_exchange_n(&s_wake_pending, 1, __ATOMIC_ACQ_REL)) {
+        SDL_Event ev;
+        memset(&ev, 0, sizeof ev);
+        ev.type = s_frame_event;
+        if (SDL_PushEvent(&ev) <= 0)
+            __atomic_store_n(&s_wake_pending, 0, __ATOMIC_RELEASE);
+    }
+}
+
+/* Internal bridge used by the NV2A GL backend after this window exists. */
+void *xbox_FramebufferWindowOpenGLWindow(void)
+{
+    return s_gl_present ? s_fb_window : NULL;
+}
+
 static void present_copy(uint32_t fb_va, uint32_t pitch)
 {
     struct fb_slot *s = &s_slot[s_back];
@@ -163,7 +184,10 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
         return;
     __atomic_add_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
     if (__atomic_load_n(&s_running, __ATOMIC_SEQ_CST))
-        present_copy(fb_va, pitch);
+        if (s_gl_present)
+            notify_direct_frame();
+        else
+            present_copy(fb_va, pitch);
     __atomic_sub_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
 }
 
@@ -296,6 +320,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         scale = 2;
 
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest");
+    s_gl_present = env_on("RECOMP_GL_PRESENT");
     if (SDL_Init(FBWIN_SDL_SUBSYSTEMS) != 0) {
         fprintf(stderr, "  [FBWIN] SDL video unavailable (%s); running headless\n",
                 SDL_GetError());
@@ -303,25 +328,37 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     }
     /* Honor the same fullscreen environment setting as the Windows presenter. */
     Uint32 window_flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
+    if (s_gl_present) {
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+        SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+        window_flags |= SDL_WINDOW_OPENGL;
+    }
     if (env_on("RECOMP_FULLSCREEN"))
         window_flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
 
     win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                            (int)FB_W * scale, (int)FB_H * scale,
                            window_flags);
-    ren = win ? SDL_CreateRenderer(win, -1,
-                                   vsync ? SDL_RENDERER_PRESENTVSYNC : 0)
-              : NULL;
-    if (!ren) {
+    s_fb_window = win;
+    ren = win && !s_gl_present ? SDL_CreateRenderer(win, -1,
+                                   vsync ? SDL_RENDERER_PRESENTVSYNC : 0) : NULL;
+    if (!win || (!s_gl_present && !ren)) {
         fprintf(stderr, "  [FBWIN] SDL window/renderer failed (%s); running headless\n",
                 SDL_GetError());
         if (win)
             SDL_DestroyWindow(win);
+        s_fb_window = NULL;
         SDL_QuitSubSystem(FBWIN_SDL_SUBSYSTEMS);
         return guest_main();
     }
-    SDL_RenderSetLogicalSize(ren, (int)FB_W, (int)FB_H);
-    {
+    if (!s_gl_present)
+        SDL_RenderSetLogicalSize(ren, (int)FB_W, (int)FB_H);
+    if (s_gl_present) {
+        fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u, direct OpenGL presentation, vsync %s); guest runs on a pthread\n",
+                FB_W, FB_H, vsync ? "on" : "off");
+    } else {
         SDL_RendererInfo ri;
         if (SDL_GetRendererInfo(ren, &ri) == 0)
             fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u, SDL %s renderer,"
@@ -332,8 +369,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     s_guest_done_event = SDL_RegisterEvents(2);
     if (s_guest_done_event == (Uint32)-1) {
         fprintf(stderr, "  [FBWIN] SDL_RegisterEvents failed; running headless\n");
-        SDL_DestroyRenderer(ren);
+        if (ren)
+            SDL_DestroyRenderer(ren);
         SDL_DestroyWindow(win);
+        s_fb_window = NULL;
         SDL_QuitSubSystem(FBWIN_SDL_SUBSYSTEMS);
         return guest_main();
     }
@@ -348,8 +387,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         fprintf(stderr, "  [FBWIN] cannot start the guest thread; running headless\n");
         s_running = 0;
         xbox_InputSetMainPump(0);
-        SDL_DestroyRenderer(ren);
+        if (ren)
+            SDL_DestroyRenderer(ren);
         SDL_DestroyWindow(win);
+        s_fb_window = NULL;
         SDL_QuitSubSystem(FBWIN_SDL_SUBSYSTEMS);
         return guest_main();
     }
@@ -392,17 +433,19 @@ int xbox_HostWindowMain(int (*guest_main)(void))
 
         if (seq != shown_seq) {
             shown_seq = seq;
-            px = s_slot[s_front].px;
-            bpp = s_slot[s_front].bpp;
-            pitch = FB_W * bpp;
-        } else if (!shown_seq && s_fb_va && s_fb_pitch) {
+            if (!s_gl_present) {
+                px = s_slot[s_front].px;
+                bpp = s_slot[s_front].bpp;
+                pitch = FB_W * bpp;
+            }
+        } else if (!s_gl_present && !shown_seq && s_fb_va && s_fb_pitch) {
             /* No flip yet: the display surface, as the GDI window reads it. */
             bpp = s_fb_pitch / FB_W;
             pitch = s_fb_pitch;
             if (bpp == 2 || bpp == 4)
                 px = (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
         }
-        if (px) {
+        if (!s_gl_present && px) {
             if (!tex || bpp != tex_bpp) {
                 if (tex)
                     SDL_DestroyTexture(tex);
@@ -416,7 +459,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 SDL_UpdateTexture(tex, NULL, px, (int)pitch);
             dirty = 1;
         }
-        if (dirty) {
+        if (!s_gl_present && dirty) {
             dirty = 0;
             SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
             SDL_RenderClear(ren);
@@ -462,7 +505,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
      * start calling SDL_GameControllerUpdate while SDL goes down. */
     if (tex)
         SDL_DestroyTexture(tex);
-    SDL_DestroyRenderer(ren);
+    if (ren)
+        SDL_DestroyRenderer(ren);
+    s_fb_window = NULL;
     SDL_DestroyWindow(win);
     if (!xbox_InputAnyOpen())
         SDL_Quit();

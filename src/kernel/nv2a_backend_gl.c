@@ -43,6 +43,9 @@ static GpuVertex *s_vertices;
 static size_t s_vertex_capacity;
 static uint8_t *s_readback;
 static size_t s_readback_size;
+static int s_owns_window;
+
+extern void *xbox_FramebufferWindowOpenGLWindow(void);
 
 /* The pushbuffer scanner owns the GL work thread, not boot_and_run(). SDL
  * contexts are thread-affine, so bind the context when a renderer callback is
@@ -368,6 +371,15 @@ static void backend_sync(uint32_t surface_va)
     dst=(uint8_t*)((uintptr_t)xbox_GetMemoryOffset()+s->color_va);
     if(s->bytes_per_pixel==4){for(y=0;y<s->height;y++)memcpy(dst+(size_t)y*s->pitch,s_readback+(size_t)y*s->width*4,(size_t)s->width*4);}
     else if(s->bytes_per_pixel==2){for(y=0;y<s->height;y++){uint32_t x;uint16_t *d=(uint16_t*)(dst+(size_t)y*s->pitch);const uint8_t *p=s_readback+(size_t)y*s->width*4;for(x=0;x<s->width;x++)d[x]=(uint16_t)(((p[x*4+2]>>3)<<11)|((p[x*4+1]>>2)<<5)|(p[x*4]>>3));}}
+    if(!s_owns_window){
+        int w=0,h=0;SDL_GL_GetDrawableSize(s_window,&w,&h);
+        if(w>0&&h>0){
+            glBindFramebuffer(GL_READ_FRAMEBUFFER,t->fbo);glReadBuffer(GL_COLOR_ATTACHMENT0);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER,0);glDrawBuffer(GL_BACK);
+            glBlitFramebuffer(0,0,(GLint)s->width,(GLint)s->height,0,0,w,h,GL_COLOR_BUFFER_BIT,GL_NEAREST);
+            SDL_GL_SwapWindow(s_window);
+        }
+    }
 }
 
 int nv2a_gl_backend_init(void)
@@ -375,10 +387,16 @@ int nv2a_gl_backend_init(void)
     static Nv2aBackend backend={backend_clear,backend_draw,backend_flip};GLuint vs,fs;GLint ok=0;
     if(!(SDL_WasInit(SDL_INIT_VIDEO)&SDL_INIT_VIDEO) && SDL_InitSubSystem(SDL_INIT_VIDEO)!=0){fprintf(stderr,"[NV2A-GL] SDL video init failed: %s\n",SDL_GetError());return 0;}
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION,3);SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION,3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,SDL_GL_CONTEXT_PROFILE_CORE);SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER,0);
-    s_window=SDL_CreateWindow("UC2 NV2A OpenGL",SDL_WINDOWPOS_UNDEFINED,SDL_WINDOWPOS_UNDEFINED,16,16,SDL_WINDOW_OPENGL|SDL_WINDOW_HIDDEN);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,SDL_GL_CONTEXT_PROFILE_CORE);
+    s_window=(SDL_Window*)xbox_FramebufferWindowOpenGLWindow();
+    if(s_window)s_owns_window=0;
+    else{
+        SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER,0);
+        s_window=SDL_CreateWindow("UC2 NV2A OpenGL",SDL_WINDOWPOS_UNDEFINED,SDL_WINDOWPOS_UNDEFINED,16,16,SDL_WINDOW_OPENGL|SDL_WINDOW_HIDDEN);
+        s_owns_window=1;
+    }
     if(!s_window){fprintf(stderr,"[NV2A-GL] GPU window creation failed: %s\n",SDL_GetError());return 0;}
-    s_context=SDL_GL_CreateContext(s_window);if(!s_context){fprintf(stderr,"[NV2A-GL] GPU context creation failed: %s\n",SDL_GetError());SDL_DestroyWindow(s_window);s_window=NULL;return 0;}
+    s_context=SDL_GL_CreateContext(s_window);if(!s_context){fprintf(stderr,"[NV2A-GL] GPU context creation failed: %s\n",SDL_GetError());if(s_owns_window)SDL_DestroyWindow(s_window);s_window=NULL;return 0;}
     if(SDL_GL_MakeCurrent(s_window,s_context)!=0){fprintf(stderr,"[NV2A-GL] GPU context activation failed: %s\n",SDL_GetError());return 0;}
     fprintf(stderr,"[NV2A-GL] hardware OpenGL %s | %s\n",glGetString(GL_VERSION),glGetString(GL_RENDERER));
     if(!glGetString(GL_RENDERER)||strstr((const char*)glGetString(GL_RENDERER),"llvmpipe")||strstr((const char*)glGetString(GL_RENDERER),"softpipe")){fprintf(stderr,"[NV2A-GL] software OpenGL renderer rejected; install/enable a hardware GPU driver\n");return 0;}
@@ -389,6 +407,12 @@ int nv2a_gl_backend_init(void)
     s_rc_final0=glGetUniformLocation(s_program,"u_final0");s_rc_final1=glGetUniformLocation(s_program,"u_final1");s_rc_finalc0=glGetUniformLocation(s_program,"u_finalc0");s_rc_finalc1=glGetUniformLocation(s_program,"u_finalc1");s_rc_control=glGetUniformLocation(s_program,"u_control");s_rc_stage=glGetUniformLocation(s_program,"u_stage");s_rc_clip=glGetUniformLocation(s_program,"u_clip");
     for(int i=0;i<4;i++){char name[32];snprintf(name,sizeof name,"u_tex[%d]",i);s_tex_samplers[i]=glGetUniformLocation(s_program,name);snprintf(name,sizeof name,"u_tex_enabled[%d]",i);s_tex_enabled[i]=glGetUniformLocation(s_program,name);}
     glGenVertexArrays(1,&s_vao);glGenBuffers(1,&s_vbo);nv2a_backend_register_with_surface_sync(&backend,backend_sync);
+    if(!s_owns_window){
+        const char *vsync=getenv("RECOMP_PRESENT_VSYNC");
+        int interval=(!vsync||!*vsync||*vsync!='0')?1:0;
+        if(SDL_GL_SetSwapInterval(interval)!=0)fprintf(stderr,"[NV2A-GL] swap interval %d unavailable: %s\n",interval,SDL_GetError());
+        fprintf(stderr,"[NV2A-GL] presenting render targets directly to the framebuffer window\n");
+    }
     /* Leave it unowned; the executor thread will bind it on its first call. */
     SDL_GL_MakeCurrent(s_window,NULL);
     return 1;
@@ -405,5 +429,5 @@ void nv2a_gl_backend_shutdown(void)
     if(s_program)glDeleteProgram(s_program);
     free(s_readback);
     free(s_vertices);s_vertices=NULL;s_vertex_capacity=0;
-    SDL_GL_DeleteContext(s_context);SDL_DestroyWindow(s_window);s_context=NULL;s_window=NULL;
+    SDL_GL_DeleteContext(s_context);if(s_owns_window)SDL_DestroyWindow(s_window);s_context=NULL;s_window=NULL;s_owns_window=0;
 }
