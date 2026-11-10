@@ -25,8 +25,8 @@ static SDL_GLContext s_context;
 static GLuint s_program, s_vao, s_vbo;
 static GLint s_size, s_sampler, s_use_texture, s_alpha_enable, s_alpha_func, s_alpha_ref;
 static Target s_targets[TARGET_CACHE];
-static Target *s_active_target;
 static uint64_t s_target_clock;
+static uint64_t s_draw_calls, s_sync_calls;
 static CachedTexture s_textures[TEX_CACHE];
 static unsigned s_next_texture;
 static uint8_t *s_readback;
@@ -99,7 +99,7 @@ static Target *ensure_target(const Nv2aSurface *s)
 {
     unsigned i,slot=0;uint64_t oldest=UINT64_MAX;Target *t=target_for_va(s->color_va);
     if(t && t->s.width==s->width && t->s.height==s->height && t->s.pitch==s->pitch){
-        t->used=++s_target_clock;s_active_target=t;return t;
+        t->used=++s_target_clock;return t;
     }
     if(t)destroy_target(t);
     for(i=0;i<TARGET_CACHE;i++){
@@ -116,7 +116,7 @@ static Target *ensure_target(const Nv2aSurface *s)
     glRenderbufferStorage(GL_RENDERBUFFER,GL_DEPTH24_STENCIL8,(GLsizei)s->width,(GLsizei)s->height);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER,GL_DEPTH_STENCIL_ATTACHMENT,GL_RENDERBUFFER,t->depth);
     if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE){ fprintf(stderr,"[NV2A-GL] framebuffer setup failed for 0x%08X\n",s->color_va); destroy_target(t);return NULL; }
-    s_active_target=t;return t;
+    return t;
 }
 
 static int same_tex(const Nv2aTexture *a,const Nv2aTexture *b)
@@ -171,6 +171,12 @@ static void backend_draw(const Nv2aSurface *s,const Nv2aBatch *b)
         v[i].color[0]=(uint8_t)(a->diffuse>>16);v[i].color[1]=(uint8_t)(a->diffuse>>8);v[i].color[2]=(uint8_t)a->diffuse;v[i].color[3]=(uint8_t)(a->diffuse>>24);
         v[i].u=a->u/(b->texture&&b->texture->width?b->texture->width:1);v[i].v=a->v/(b->texture&&b->texture->height?b->texture->height:1);}
     if(b->texture)tex=texture_for(b->texture);
+    if(s_draw_calls<4){
+        fprintf(stderr,"[NV2A-GL] draw %llu surface=0x%08X verts=%u first=(%.2f,%.2f,%.4f) rgba=%08X tex=%s\n",
+                (unsigned long long)s_draw_calls,s->color_va,b->count,
+                b->vertices[0].x,b->vertices[0].y,b->vertices[0].z,
+                b->vertices[0].diffuse,tex?"yes":"no");
+    }
     glBindFramebuffer(GL_FRAMEBUFFER,t->fbo);glViewport(0,0,(GLsizei)s->width,(GLsizei)s->height);glUseProgram(s_program);glBindVertexArray(s_vao);
     glEnableVertexAttribArray(0);glEnableVertexAttribArray(1);glEnableVertexAttribArray(2);
     glUniform2f(s_size,(float)s->width,(float)s->height);glUniform1i(s_sampler,0);glUniform1i(s_use_texture,tex?1:0);
@@ -185,19 +191,33 @@ static void backend_draw(const Nv2aSurface *s,const Nv2aBatch *b)
     glVertexAttribPointer(0,4,GL_FLOAT,GL_FALSE,sizeof *v,(void*)offsetof(GpuVertex,x));
     glVertexAttribPointer(1,4,GL_UNSIGNED_BYTE,GL_TRUE,sizeof *v,(void*)offsetof(GpuVertex,color));
     glVertexAttribPointer(2,2,GL_FLOAT,GL_FALSE,sizeof *v,(void*)offsetof(GpuVertex,u));
-    glDrawArrays(GL_TRIANGLES,0,(GLsizei)b->count);free(v);
+    glDrawArrays(GL_TRIANGLES,0,(GLsizei)b->count);
+    if(s_draw_calls<4){GLenum e=glGetError();if(e!=GL_NO_ERROR)fprintf(stderr,"[NV2A-GL] draw GL error 0x%04X\n",e);}
+    s_draw_calls++;free(v);
 }
 
 static void backend_flip(void) { if(make_current())glFlush(); }
 
 static void backend_sync(uint32_t surface_va)
 {
-    size_t need; uint32_t y; uint8_t *dst; Target *t;const Nv2aSurface *s;
-    if(!make_current() || !(t=target_for_va(surface_va)))return;
+    size_t need; uint32_t y; uint8_t *dst; Target *t;const Nv2aSurface *s;uint64_t seq=++s_sync_calls;
+    if(!make_current())return;
+    if(!(t=target_for_va(surface_va))){
+        if(seq<=12){unsigned i;fprintf(stderr,"[NV2A-GL] sync %llu surface=0x%08X missing; cached:",
+                (unsigned long long)seq,surface_va);for(i=0;i<TARGET_CACHE;i++)if(s_targets[i].fbo)fprintf(stderr," 0x%08X",s_targets[i].s.color_va);fputc('\n',stderr);}
+        return;
+    }
     s=&t->s;if(!s->color_va || !s->width || !s->height)return;
     glBindFramebuffer(GL_FRAMEBUFFER,t->fbo);glFinish();need=(size_t)s->width*s->height*4;
     if(need>s_readback_size){uint8_t *p=(uint8_t*)realloc(s_readback,need);if(!p)return;s_readback=p;s_readback_size=need;}
     glPixelStorei(GL_PACK_ALIGNMENT,1);glReadPixels(0,0,(GLsizei)s->width,(GLsizei)s->height,GL_BGRA,GL_UNSIGNED_BYTE,s_readback);
+    if(seq<=8 || seq%120==0){
+        size_t p,nz=0;GLenum e=glGetError();
+        for(p=0;p<need;p+=4)if(s_readback[p]||s_readback[p+1]||s_readback[p+2])nz++;
+        fprintf(stderr,"[NV2A-GL] sync %llu surface=0x%08X %ux%u nonblack=%llu/%llu GL=0x%04X\n",
+                (unsigned long long)seq,surface_va,s->width,s->height,
+                (unsigned long long)nz,(unsigned long long)((size_t)s->width*s->height),e);
+    }
     dst=(uint8_t*)((uintptr_t)xbox_GetMemoryOffset()+s->color_va);
     if(s->bytes_per_pixel==4){for(y=0;y<s->height;y++)memcpy(dst+(size_t)y*s->pitch,s_readback+(size_t)y*s->width*4,(size_t)s->width*4);}
     else if(s->bytes_per_pixel==2){for(y=0;y<s->height;y++){uint32_t x;uint16_t *d=(uint16_t*)(dst+(size_t)y*s->pitch);const uint8_t *p=s_readback+(size_t)y*s->width*4;for(x=0;x<s->width;x++)d[x]=(uint16_t)(((p[x*4+2]>>3)<<11)|((p[x*4+1]>>2)<<5)|(p[x*4]>>3));}}
