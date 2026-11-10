@@ -20,11 +20,13 @@ if(WIN32)
 else()
     add_library(xbox_d3d8 STATIC
         d3d8_gl.c
+        ../kernel/nv2a_backend_gl.c
     )
     find_package(SDL2 REQUIRED)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(EPOXY REQUIRED epoxy)
-    target_include_directories(xbox_d3d8 PRIVATE ${EPOXY_INCLUDE_DIRS})
+    target_include_directories(xbox_d3d8 PRIVATE ${EPOXY_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../kernel)
     # EPOXY_LINK_LIBRARIES, not EPOXY_LIBRARIES: the latter is the bare name
     # `epoxy`, which only resolves if EPOXY_LIBRARY_DIRS happens to be on the
     # link path. That holds for the top-level build and not when this is pulled
