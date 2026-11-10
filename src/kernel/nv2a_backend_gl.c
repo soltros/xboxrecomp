@@ -5,6 +5,7 @@
 #include "nv2a_backend_gl.h"
 #include "nv2a_backend.h"
 #include "xbox_memory_layout.h"
+#include "../nv2a/nv2a_regs.h"
 
 #include <SDL.h>
 #include <epoxy/gl.h>
@@ -22,13 +23,23 @@ typedef struct { float x,y,z,rhw; uint8_t color[4],specular[4]; float tc[4][3]; 
 typedef struct {
     uint64_t seq;
     uint32_t surface, count, diffuse, tex0, tex1, stage, color_mask;
-    float min_x, max_x, min_y, max_y;
+    uint32_t control, ci0, ai0, co0, ao0, final0, final1;
+    uint32_t depth_func, depth_write, blend_src, blend_dst, clip_mode;
+    uint32_t tex0_size, tex0_pitch, tex0_format;
+    float min_x, max_x, min_y, max_y, min_z, max_z, min_rhw, max_rhw;
     uint8_t combiner, alpha_test, blend, depth, cull, cull_face, front_face;
 } DrawTrace;
 
 static SDL_Window *s_window;
 static SDL_GLContext s_context;
 static GLuint s_program, s_vao, s_vbo;
+static GLuint s_pvideo_program, s_pvideo_vao, s_pvideo_vbo, s_pvideo_texture;
+static GLint s_pv_base, s_pv_yuy, s_pv_window, s_pv_guest, s_pv_origin;
+static GLint s_pv_out_size, s_pv_in_size, s_pv_start, s_pv_step, s_pv_key_on, s_pv_key;
+static uint32_t s_pvideo_regs[0x1000 / 4];
+static int s_pvideo_active;
+static uint64_t s_pvideo_frames;
+static unsigned s_pvideo_bank;
 static GLint s_size, s_alpha_enable, s_alpha_func, s_alpha_ref;
 static GLint s_rc_enable,s_rc_ci,s_rc_ai,s_rc_co,s_rc_ao,s_rc_f0,s_rc_f1;
 static GLint s_rc_final0,s_rc_final1,s_rc_finalc0,s_rc_finalc1,s_rc_control,s_rc_stage,s_rc_clip;
@@ -138,12 +149,145 @@ static const char *fs_src =
     " else if(u_alpha_func==518)pass=c.a>=u_alpha_ref; else pass=true; if(!pass)discard;}"
     " o_color=c; }";
 
+/* PVIDEO carries Xbox movie frames as YUY2 and scans them over the 3D
+ * framebuffer. Keep both conversion and composition on the host GPU. */
+static const char *pvideo_vs_src =
+    "#version 330 core\n"
+    "layout(location=0) in vec2 p; void main(){gl_Position=vec4(p,0.0,1.0);}";
+static const char *pvideo_fs_src =
+    "#version 330 core\n"
+    "out vec4 color; uniform sampler2D u_base; uniform sampler2D u_yuy;"
+    "uniform vec2 u_window,u_guest,u_origin,u_out_size,u_in_size,u_start,u_step;"
+    "uniform int u_key_on; uniform vec3 u_key;"
+    "void main(){vec2 q=vec2(gl_FragCoord.x*u_guest.x/u_window.x,"
+    "(u_window.y-gl_FragCoord.y)*u_guest.y/u_window.y);"
+    "vec4 under=texture(u_base,vec2(q.x/u_guest.x,q.y/u_guest.y));"
+    "if(q.x<u_origin.x||q.y<u_origin.y||q.x>=u_origin.x+u_out_size.x||"
+    "q.y>=u_origin.y+u_out_size.y)discard;"
+    "if(u_key_on!=0&&any(notEqual(floor(under.rgb*255.0+0.5),u_key)))discard;"
+    "vec2 st=u_start+(q-u_origin)*u_step;"
+    "if(any(lessThan(st,vec2(0.0)))||st.x>=u_in_size.x||st.y>=u_in_size.y)discard;"
+    "float pair=floor(st.x*0.5);"
+    "vec4 yuv=texture(u_yuy,vec2((pair+0.5)/ceil(u_in_size.x*0.5),"
+    "(floor(st.y)+0.5)/u_in_size.y));"
+    "float y=(mod(floor(st.x),2.0)<1.0?yuv.r:yuv.b)*255.0-16.0;"
+    "float u=yuv.g*255.0-128.0,v=yuv.a*255.0-128.0;"
+    "vec3 rgb=clamp(vec3(298.0*y+409.0*v,298.0*y-100.0*u-208.0*v,"
+    "298.0*y+516.0*u)/255.0,0.0,255.0)/255.0;color=vec4(rgb,1.0);}";
+
 static GLuint compile_shader(GLenum type, const char *src)
 {
     GLuint sh=glCreateShader(type); GLint ok=0; char log[1024];
     glShaderSource(sh,1,&src,NULL); glCompileShader(sh); glGetShaderiv(sh,GL_COMPILE_STATUS,&ok);
     if(!ok){ glGetShaderInfoLog(sh,sizeof log,NULL,log); fprintf(stderr,"[NV2A-GL] shader: %s\n",log); glDeleteShader(sh); return 0; }
     return sh;
+}
+
+/* On POSIX the 16 MB NV2A aperture is mapped RAM, so the Xbox's PVIDEO
+ * register writes land at FD008000 without passing through the Windows NV2A
+ * model. Read that register block here and latch each submitted YUY2 bank. */
+static int pvideo_latch(void)
+{
+    volatile uint32_t *regs = (volatile uint32_t *)
+        ((uintptr_t)xbox_GetMemoryOffset() + 0xFD008000u);
+    uint32_t snapshot[0x1000 / 4], pending;
+    unsigned i, bank;
+    if (!xbox_GetMemoryBase()) return 0;
+    for (i = 0; i < 0x1000 / 4; ++i)
+        snapshot[i] = __atomic_load_n(&regs[i], __ATOMIC_RELAXED);
+    if (snapshot[NV_PVIDEO_STOP / 4] & 1u) {
+        s_pvideo_active = 0;
+        return 0;
+    }
+    pending = snapshot[NV_PVIDEO_BUFFER / 4];
+    for (bank = 0; bank < 2; ++bank) {
+        uint32_t bit = 1u << (bank * 4u);
+        uint32_t format, pitch, dimensions, width, height;
+        uint64_t physical, bytes;
+        const void *pixels;
+        GLint old_row_length = 0;
+        if (!(pending & bit)) continue;
+        format = snapshot[(NV_PVIDEO_FORMAT + bank * 4u) / 4u];
+        pitch = format & NV_PVIDEO_FORMAT_PITCH;
+        dimensions = snapshot[(NV_PVIDEO_SIZE_IN + bank * 4u) / 4u];
+        width = dimensions & NV_PVIDEO_SIZE_IN_WIDTH;
+        height = (dimensions & NV_PVIDEO_SIZE_IN_HEIGHT) >> 16;
+        bytes = (uint64_t)pitch * height;
+        physical = (uint64_t)snapshot[(NV_PVIDEO_BASE + bank * 4u) / 4u] +
+                   snapshot[(NV_PVIDEO_OFFSET + bank * 4u) / 4u];
+        if (!width || !height || (width & 1u) || pitch < width * 2u ||
+            (pitch & 3u) ||
+            ((format & NV_PVIDEO_FORMAT_COLOR) >> 16) !=
+                NV_PVIDEO_FORMAT_COLOR_LE_CR8YB8CB8YA8 ||
+            bytes > XBOX_TOTAL_RAM || physical + bytes > XBOX_TOTAL_RAM)
+            continue;
+        pixels = (const void *)((uintptr_t)xbox_GetMemoryOffset() +
+                                0x80000000u + (uintptr_t)physical);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, s_pvideo_texture);
+        glGetIntegerv(GL_UNPACK_ROW_LENGTH, &old_row_length);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(pitch / 4u));
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)(width / 2u),
+                     (GLsizei)height, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, old_row_length);
+        memcpy(s_pvideo_regs, snapshot, sizeof(s_pvideo_regs));
+        s_pvideo_bank = bank;
+        __atomic_fetch_and(&regs[NV_PVIDEO_BUFFER / 4], ~bit, __ATOMIC_RELEASE);
+        s_pvideo_active = 1;
+        ++s_pvideo_frames;
+        if (s_pvideo_frames == 1 || s_pvideo_frames % 300 == 0)
+            fprintf(stderr, "[NV2A-GL] PVIDEO YUY2 frame %llu: %ux%u pitch=%u bank=%u\n",
+                    (unsigned long long)s_pvideo_frames, width, height, pitch, bank);
+        break;
+    }
+    return s_pvideo_active;
+}
+
+static void pvideo_present(const Target *target, int window_w, int window_h)
+{
+    uint32_t bank = s_pvideo_bank;
+    uint32_t format, point, size, point_in;
+    if (!pvideo_latch() || !target || window_w <= 0 || window_h <= 0)
+        return;
+    bank = s_pvideo_bank;
+    format = s_pvideo_regs[(NV_PVIDEO_FORMAT + bank * 4u) / 4u];
+    point = s_pvideo_regs[(NV_PVIDEO_POINT_OUT + bank * 4u) / 4u];
+    size = s_pvideo_regs[(NV_PVIDEO_SIZE_OUT + bank * 4u) / 4u];
+    point_in = s_pvideo_regs[(NV_PVIDEO_POINT_IN + bank * 4u) / 4u];
+    glViewport(0, 0, window_w, window_h);
+    glDisable(GL_SCISSOR_TEST); glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST); glDisable(GL_CULL_FACE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glUseProgram(s_pvideo_program); glBindVertexArray(s_pvideo_vao);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, target->color);
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, s_pvideo_texture);
+    glUniform1i(s_pv_base, 0); glUniform1i(s_pv_yuy, 1);
+    glUniform2f(s_pv_window, (float)window_w, (float)window_h);
+    glUniform2f(s_pv_guest, (float)target->s.width, (float)target->s.height);
+    glUniform2f(s_pv_origin, (float)(point & NV_PVIDEO_POINT_OUT_X),
+                (float)((point & NV_PVIDEO_POINT_OUT_Y) >> 16));
+    glUniform2f(s_pv_out_size, (float)(size & NV_PVIDEO_SIZE_OUT_WIDTH),
+                (float)((size & NV_PVIDEO_SIZE_OUT_HEIGHT) >> 16));
+    glUniform2f(s_pv_in_size,
+                (float)(s_pvideo_regs[(NV_PVIDEO_SIZE_IN + bank * 4u) / 4u] &
+                        NV_PVIDEO_SIZE_IN_WIDTH),
+                (float)((s_pvideo_regs[(NV_PVIDEO_SIZE_IN + bank * 4u) / 4u] &
+                         NV_PVIDEO_SIZE_IN_HEIGHT) >> 16));
+    glUniform2f(s_pv_start,
+                (float)((point_in & NV_PVIDEO_POINT_IN_S) / 16.0),
+                (float)(((point_in >> 17) << 17) / 1048576.0));
+    glUniform2f(s_pv_step,
+                (float)(s_pvideo_regs[(NV_PVIDEO_DS_DX + bank * 4u) / 4u] / 1048576.0),
+                (float)(s_pvideo_regs[(NV_PVIDEO_DT_DY + bank * 4u) / 4u] / 1048576.0));
+    glUniform1i(s_pv_key_on,
+                ((format & NV_PVIDEO_FORMAT_DISPLAY) >> 20) ==
+                    NV_PVIDEO_FORMAT_DISPLAY_COLOR_KEY);
+    glUniform3f(s_pv_key,
+                (float)((s_pvideo_regs[NV_PVIDEO_COLOR_KEY / 4] >> 16) & 255u),
+                (float)((s_pvideo_regs[NV_PVIDEO_COLOR_KEY / 4] >> 8) & 255u),
+                (float)(s_pvideo_regs[NV_PVIDEO_COLOR_KEY / 4] & 255u));
+    glDrawArrays(GL_TRIANGLES, 0, 6);
 }
 
 static Target *target_for_va(uint32_t va)
@@ -261,6 +405,7 @@ static void backend_draw(const Nv2aSurface *s,const Nv2aBatch *b)
 {
     uint32_t i; GpuVertex *v; GLuint tex[4]={0}; const Nv2aRenderState *r=b->state;Target *t;
     float min_x=0.0f,max_x=0.0f,min_y=0.0f,max_y=0.0f;
+    float min_z=0.0f,max_z=0.0f,min_rhw=0.0f,max_rhw=0.0f;
     if(!b->count || !make_current() || !(t=ensure_target(s)))return;
     if((size_t)b->count>s_vertex_capacity){
         size_t cap=s_vertex_capacity?s_vertex_capacity:256;
@@ -271,8 +416,8 @@ static void backend_draw(const Nv2aSurface *s,const Nv2aBatch *b)
     }
     v=s_vertices;
     for(i=0;i<b->count;i++){const Nv2aVertex *a=&b->vertices[i]; v[i].x=a->x;v[i].y=a->y;v[i].z=a->z;v[i].rhw=a->rhw;
-        if(i==0){min_x=max_x=a->x;min_y=max_y=a->y;}
-        else{if(a->x<min_x)min_x=a->x;if(a->x>max_x)max_x=a->x;if(a->y<min_y)min_y=a->y;if(a->y>max_y)max_y=a->y;}
+        if(i==0){min_x=max_x=a->x;min_y=max_y=a->y;min_z=max_z=a->z;min_rhw=max_rhw=a->rhw;}
+        else{if(a->x<min_x)min_x=a->x;if(a->x>max_x)max_x=a->x;if(a->y<min_y)min_y=a->y;if(a->y>max_y)max_y=a->y;if(a->z<min_z)min_z=a->z;if(a->z>max_z)max_z=a->z;if(a->rhw<min_rhw)min_rhw=a->rhw;if(a->rhw>max_rhw)max_rhw=a->rhw;}
         v[i].color[0]=(uint8_t)(a->diffuse>>16);v[i].color[1]=(uint8_t)(a->diffuse>>8);v[i].color[2]=(uint8_t)a->diffuse;v[i].color[3]=(uint8_t)(a->diffuse>>24);
         v[i].specular[0]=(uint8_t)(a->specular>>16);v[i].specular[1]=(uint8_t)(a->specular>>8);v[i].specular[2]=(uint8_t)a->specular;v[i].specular[3]=(uint8_t)(a->specular>>24);
         {const float uv[4][2]={{a->u,a->v},{a->u1,a->v1},{a->u2,a->v2},{a->u3,a->v3}};const float q[4]={a->q0,a->q1,a->q2,a->q3};int st;
@@ -322,7 +467,16 @@ static void backend_draw(const Nv2aSurface *s,const Nv2aBatch *b)
         d->tex0=b->textures[0]?b->textures[0]->offset:0;
         d->tex1=b->textures[1]?b->textures[1]->offset:0;
         d->stage=r->combiner.stage_program; d->color_mask=r->color_mask;
+        d->control=r->combiner.control;d->ci0=r->combiner.color_icw[0];d->ai0=r->combiner.alpha_icw[0];
+        d->co0=r->combiner.color_ocw[0];d->ao0=r->combiner.alpha_ocw[0];
+        d->final0=r->combiner.final0;d->final1=r->combiner.final1;
+        d->depth_func=r->depth_func;d->depth_write=r->depth_write;
+        d->blend_src=r->blend_src;d->blend_dst=r->blend_dst;d->clip_mode=r->clip_plane_mode;
+        d->tex0_size=b->textures[0]?((b->textures[0]->width&0xffffu)<<16)|(b->textures[0]->height&0xffffu):0;
+        d->tex0_pitch=b->textures[0]?b->textures[0]->pitch:0;
+        d->tex0_format=b->textures[0]?b->textures[0]->color:0;
         d->min_x=min_x;d->max_x=max_x;d->min_y=min_y;d->max_y=max_y;
+        d->min_z=min_z;d->max_z=max_z;d->min_rhw=min_rhw;d->max_rhw=max_rhw;
         d->combiner=r->combiner_enable; d->alpha_test=r->alpha_test_enable;
         d->blend=r->blend_enable; d->depth=r->depth_test_enable;
         d->cull=r->cull_enable;d->cull_face=(uint8_t)r->cull_face;d->front_face=(uint8_t)r->front_face;
@@ -360,11 +514,12 @@ static void backend_sync(uint32_t surface_va)
                     (unsigned long long)s_draw_calls);
             for(n=first;n<s_draw_calls;n++){
                 const DrawTrace *d=&s_draw_trace[n%8];
-                if(d->seq==n)fprintf(stderr,"[NV2A-GL]   draw %llu surface=%08X verts=%u xy=%.2f..%.2f/%.2f..%.2f rgba=%08X tex=%08X/%08X stage=%08X rc=%u alpha=%u blend=%u depth=%u cull=%u:%02X/%02X mask=%08X\n",
+                if(d->seq==n)fprintf(stderr,"[NV2A-GL]   draw %llu surface=%08X verts=%u xy=%.2f..%.2f/%.2f..%.2f z=%.3f..%.3f rhw=%.4g..%.4g rgba=%08X tex=%08X/%08X (%ux%u fmt=%02X pitch=%u) stage=%08X rc=%u ctrl=%08X comb=%08X/%08X:%08X/%08X final=%08X/%08X alpha=%u blend=%u:%X/%X depth=%u:%X write=%u cull=%u:%02X/%02X clip=%08X mask=%08X\n",
                     (unsigned long long)d->seq,d->surface,d->count,
-                    d->min_x,d->max_x,d->min_y,d->max_y,d->diffuse,
-                    d->tex0,d->tex1,d->stage,d->combiner,d->alpha_test,
-                    d->blend,d->depth,d->cull,d->cull_face,d->front_face,d->color_mask);
+                    d->min_x,d->max_x,d->min_y,d->max_y,d->min_z,d->max_z,d->min_rhw,d->max_rhw,d->diffuse,
+                    d->tex0,d->tex1,d->tex0_size>>16,d->tex0_size&0xffffu,d->tex0_format,d->tex0_pitch,
+                    d->stage,d->combiner,d->control,d->ci0,d->ai0,d->co0,d->ao0,d->final0,d->final1,d->alpha_test,
+                    d->blend,d->blend_src,d->blend_dst,d->depth,d->depth_func,d->depth_write,d->cull,d->cull_face,d->front_face,d->clip_mode,d->color_mask);
             }
         }
     }
@@ -382,6 +537,7 @@ static void backend_sync(uint32_t surface_va)
             glBindFramebuffer(GL_READ_FRAMEBUFFER,t->fbo);glReadBuffer(GL_COLOR_ATTACHMENT0);
             glBindFramebuffer(GL_DRAW_FRAMEBUFFER,0);glDrawBuffer(GL_BACK);
             glBlitFramebuffer(0,(GLint)s->height,(GLint)s->width,0,0,0,w,h,GL_COLOR_BUFFER_BIT,GL_NEAREST);
+            pvideo_present(t,w,h);
             SDL_GL_SwapWindow(s_window);
         }
     }
@@ -407,6 +563,18 @@ int nv2a_gl_backend_init(void)
     if(!glGetString(GL_RENDERER)||strstr((const char*)glGetString(GL_RENDERER),"llvmpipe")||strstr((const char*)glGetString(GL_RENDERER),"softpipe")){fprintf(stderr,"[NV2A-GL] software OpenGL renderer rejected; install/enable a hardware GPU driver\n");return 0;}
     vs=compile_shader(GL_VERTEX_SHADER,vs_src);fs=compile_shader(GL_FRAGMENT_SHADER,fs_src);if(!vs||!fs)return 0;
     s_program=glCreateProgram();glAttachShader(s_program,vs);glAttachShader(s_program,fs);glLinkProgram(s_program);glGetProgramiv(s_program,GL_LINK_STATUS,&ok);glDeleteShader(vs);glDeleteShader(fs);if(!ok){fprintf(stderr,"[NV2A-GL] shader link failed\n");return 0;}
+    vs=compile_shader(GL_VERTEX_SHADER,pvideo_vs_src);fs=compile_shader(GL_FRAGMENT_SHADER,pvideo_fs_src);if(!vs||!fs)return 0;
+    s_pvideo_program=glCreateProgram();glAttachShader(s_pvideo_program,vs);glAttachShader(s_pvideo_program,fs);glLinkProgram(s_pvideo_program);glGetProgramiv(s_pvideo_program,GL_LINK_STATUS,&ok);glDeleteShader(vs);glDeleteShader(fs);if(!ok){fprintf(stderr,"[NV2A-GL] PVIDEO shader link failed\n");return 0;}
+    s_pv_base=glGetUniformLocation(s_pvideo_program,"u_base");s_pv_yuy=glGetUniformLocation(s_pvideo_program,"u_yuy");
+    s_pv_window=glGetUniformLocation(s_pvideo_program,"u_window");s_pv_guest=glGetUniformLocation(s_pvideo_program,"u_guest");
+    s_pv_origin=glGetUniformLocation(s_pvideo_program,"u_origin");s_pv_out_size=glGetUniformLocation(s_pvideo_program,"u_out_size");
+    s_pv_in_size=glGetUniformLocation(s_pvideo_program,"u_in_size");s_pv_start=glGetUniformLocation(s_pvideo_program,"u_start");
+    s_pv_step=glGetUniformLocation(s_pvideo_program,"u_step");s_pv_key_on=glGetUniformLocation(s_pvideo_program,"u_key_on");s_pv_key=glGetUniformLocation(s_pvideo_program,"u_key");
+    {const GLfloat quad[12]={-1,-1,1,-1,1,1,-1,-1,1,1,-1,1};
+     glGenVertexArrays(1,&s_pvideo_vao);glGenBuffers(1,&s_pvideo_vbo);glBindVertexArray(s_pvideo_vao);glBindBuffer(GL_ARRAY_BUFFER,s_pvideo_vbo);
+     glBufferData(GL_ARRAY_BUFFER,sizeof quad,quad,GL_STATIC_DRAW);glEnableVertexAttribArray(0);glVertexAttribPointer(0,2,GL_FLOAT,GL_FALSE,2*sizeof(GLfloat),(void*)0);
+     glGenTextures(1,&s_pvideo_texture);glBindTexture(GL_TEXTURE_2D,s_pvideo_texture);
+     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);}
     s_size=glGetUniformLocation(s_program,"u_size");s_alpha_enable=glGetUniformLocation(s_program,"u_alpha_enable");s_alpha_func=glGetUniformLocation(s_program,"u_alpha_func");s_alpha_ref=glGetUniformLocation(s_program,"u_alpha_ref");
     s_rc_enable=glGetUniformLocation(s_program,"u_rc_enable");s_rc_ci=glGetUniformLocation(s_program,"u_ci[0]");s_rc_ai=glGetUniformLocation(s_program,"u_ai[0]");s_rc_co=glGetUniformLocation(s_program,"u_co[0]");s_rc_ao=glGetUniformLocation(s_program,"u_ao[0]");s_rc_f0=glGetUniformLocation(s_program,"u_f0[0]");s_rc_f1=glGetUniformLocation(s_program,"u_f1[0]");
     s_rc_final0=glGetUniformLocation(s_program,"u_final0");s_rc_final1=glGetUniformLocation(s_program,"u_final1");s_rc_finalc0=glGetUniformLocation(s_program,"u_finalc0");s_rc_finalc1=glGetUniformLocation(s_program,"u_finalc1");s_rc_control=glGetUniformLocation(s_program,"u_control");s_rc_stage=glGetUniformLocation(s_program,"u_stage");s_rc_clip=glGetUniformLocation(s_program,"u_clip");
@@ -428,6 +596,10 @@ void nv2a_gl_backend_shutdown(void)
     unsigned i;nv2a_backend_register(NULL);if(!s_context)return;
     if(SDL_GL_GetCurrentContext()!=s_context && SDL_GL_MakeCurrent(s_window,s_context)!=0)return;
     for(i=0;i<TEX_CACHE;i++)if(s_textures[i].name)glDeleteTextures(1,&s_textures[i].name);
+    if(s_pvideo_texture)glDeleteTextures(1,&s_pvideo_texture);
+    if(s_pvideo_vbo)glDeleteBuffers(1,&s_pvideo_vbo);
+    if(s_pvideo_vao)glDeleteVertexArrays(1,&s_pvideo_vao);
+    if(s_pvideo_program)glDeleteProgram(s_pvideo_program);
     for(i=0;i<TARGET_CACHE;i++)destroy_target(&s_targets[i]);
     if(s_vbo)glDeleteBuffers(1,&s_vbo);
     if(s_vao)glDeleteVertexArrays(1,&s_vao);
