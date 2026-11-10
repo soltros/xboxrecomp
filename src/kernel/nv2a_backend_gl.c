@@ -239,11 +239,21 @@ static void backend_draw(const Nv2aSurface *s,const Nv2aBatch *b)
         for(st=0;st<4;st++){const Nv2aTexture *tt=b->textures[st];float w=tt&&tt->width?(float)tt->width:1.f,h=tt&&tt->height?(float)tt->height:1.f;v[i].tc[st][0]=uv[st][0]/w;v[i].tc[st][1]=uv[st][1]/h;v[i].tc[st][2]=q[st];}}
     }
     for(i=0;i<4;i++)if(b->textures[i])tex[i]=texture_for(b->textures[i]);
-    if(s_draw_calls<4){
-        fprintf(stderr,"[NV2A-GL] draw %llu surface=0x%08X verts=%u first=(%.2f,%.2f,%.4f) rgba=%08X tex=%s\n",
+    if(s_draw_calls<16){
+        fprintf(stderr,"[NV2A-GL] draw %llu surface=0x%08X verts=%u first=(%.2f,%.2f,%.4f) rgba=%08X spec=%08X uv0=(%.4f,%.4f,%.4f) rc=%u control=%08X stage=%08X icw=%08X/%08X ocw=%08X/%08X final=%08X/%08X alpha=%u:%08X mask=%08X\n",
                 (unsigned long long)s_draw_calls,s->color_va,b->count,
                 b->vertices[0].x,b->vertices[0].y,b->vertices[0].z,
-                b->vertices[0].diffuse,tex[0]?"yes":"no");
+                b->vertices[0].diffuse,b->vertices[0].specular,
+                v[0].tc[0][0],v[0].tc[0][1],v[0].tc[0][2],r->combiner_enable,
+                r->combiner.control,r->combiner.stage_program,
+                r->combiner.color_icw[0],r->combiner.alpha_icw[0],
+                r->combiner.color_ocw[0],r->combiner.alpha_ocw[0],
+                r->combiner.final0,r->combiner.final1,
+                r->alpha_test_enable,r->alpha_func,r->color_mask);
+        for(i=0;i<4;i++)if(b->textures[i])
+            fprintf(stderr,"[NV2A-GL]   tex%u offset=%08X size=%ux%u fmt=%02X enabled=%u\n",
+                    i,b->textures[i]->offset,b->textures[i]->width,b->textures[i]->height,
+                    b->textures[i]->color,tex[i]!=0);
     }
     glBindFramebuffer(GL_FRAMEBUFFER,t->fbo);glViewport(0,0,(GLsizei)s->width,(GLsizei)s->height);glUseProgram(s_program);glBindVertexArray(s_vao);
     for(i=0;i<7;i++)glEnableVertexAttribArray(i);
@@ -264,7 +274,7 @@ static void backend_draw(const Nv2aSurface *s,const Nv2aBatch *b)
     glVertexAttribPointer(2,4,GL_UNSIGNED_BYTE,GL_TRUE,sizeof *v,(void*)offsetof(GpuVertex,specular));
     for(i=0;i<4;i++)glVertexAttribPointer(3+i,3,GL_FLOAT,GL_FALSE,sizeof *v,(void*)offsetof(GpuVertex,tc)+i*sizeof v[0].tc[0]);
     glDrawArrays(GL_TRIANGLES,0,(GLsizei)b->count);
-    if(s_draw_calls<4){GLenum e=glGetError();if(e!=GL_NO_ERROR)fprintf(stderr,"[NV2A-GL] draw GL error 0x%04X\n",e);}
+    if(s_draw_calls<16){GLenum e=glGetError();if(e!=GL_NO_ERROR)fprintf(stderr,"[NV2A-GL] draw GL error 0x%04X\n",e);}
     s_draw_calls++;
 }
 
