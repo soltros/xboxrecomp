@@ -135,6 +135,7 @@ static void backend_draw(const Nv2aSurface *s,const Nv2aBatch *b)
         v[i].u=a->u/(b->texture&&b->texture->width?b->texture->width:1);v[i].v=a->v/(b->texture&&b->texture->height?b->texture->height:1);}
     if(b->texture)tex=texture_for(b->texture);
     glBindFramebuffer(GL_FRAMEBUFFER,s_target.fbo);glViewport(0,0,(GLsizei)s->width,(GLsizei)s->height);glUseProgram(s_program);glBindVertexArray(s_vao);
+    glEnableVertexAttribArray(0);glEnableVertexAttribArray(1);glEnableVertexAttribArray(2);
     glUniform2f(s_size,(float)s->width,(float)s->height);glUniform1i(s_sampler,0);glUniform1i(s_use_texture,tex?1:0);
     glUniform1i(s_alpha_enable,r->alpha_test_enable?1:0);glUniform1i(s_alpha_func,(GLint)r->alpha_func);glUniform1f(s_alpha_ref,r->alpha_ref/255.f);
     if(tex){glActiveTexture(GL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,tex);}

@@ -28,11 +28,12 @@
 
 #define SDLA_SAMPLE_RATE   48000
 #define SDLA_CHANNELS      2
-/* Device buffer size and count: the same defaults and knobs as the XAudio2
- * backend (512 x 4: 10.7 ms per buffer, 43 ms queued at the high mark). The
- * count is a pacing mark here, not a slot limit: SDL's queue is unbounded. */
+/* SDL's queue is unbounded; these values set its pacing marks and callback
+ * period. Keep more audio queued than XAudio2's low-latency defaults because
+ * a statically recompiled title can stall its APU worker during host-side
+ * scheduling or GPU readback. Callers can lower both with the env knobs. */
 #define SDLA_BUF_SAMPLES_DEFAULT 512
-#define SDLA_NUM_BUFS_DEFAULT    4
+#define SDLA_NUM_BUFS_DEFAULT    8
 #define SDLA_BUF_SAMPLES_MIN     128
 #define SDLA_BUF_SAMPLES_MAX     4096
 #define SDLA_NUM_BUFS_MIN        2
