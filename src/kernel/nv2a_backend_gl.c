@@ -29,6 +29,8 @@ static uint64_t s_target_clock;
 static uint64_t s_draw_calls, s_sync_calls;
 static CachedTexture s_textures[TEX_CACHE];
 static unsigned s_next_texture;
+static GpuVertex *s_vertices;
+static size_t s_vertex_capacity;
 static uint8_t *s_readback;
 static size_t s_readback_size;
 
@@ -55,7 +57,8 @@ static const char *vs_src =
     "layout(location=2) in vec2 a_uv; uniform vec2 u_size;"
     "out vec4 v_color; out vec2 v_uv;"
     "void main(){ vec2 p=a_pos.xy/u_size*2.0-1.0;"
-    " gl_Position=vec4(p,a_pos.z*2.0-1.0,1.0);"
+    " float w=a_pos.w>0.000001?1.0/a_pos.w:1.0;"
+    " gl_Position=vec4(p*w,(a_pos.z*2.0-1.0)*w,w);"
     " v_color=a_color; v_uv=a_uv; }";
 static const char *fs_src =
     "#version 330 core\n"
@@ -166,7 +169,14 @@ static void backend_draw(const Nv2aSurface *s,const Nv2aBatch *b)
 {
     uint32_t i; GpuVertex *v; GLuint tex=0; const Nv2aRenderState *r=b->state;Target *t;
     if(!b->count || !make_current() || !(t=ensure_target(s)))return;
-    v=(GpuVertex*)malloc((size_t)b->count*sizeof *v); if(!v)return;
+    if((size_t)b->count>s_vertex_capacity){
+        size_t cap=s_vertex_capacity?s_vertex_capacity:256;
+        GpuVertex *p;
+        while(cap<(size_t)b->count)cap*=2;
+        p=(GpuVertex*)realloc(s_vertices,cap*sizeof *p);if(!p)return;
+        s_vertices=p;s_vertex_capacity=cap;
+    }
+    v=s_vertices;
     for(i=0;i<b->count;i++){const Nv2aVertex *a=&b->vertices[i]; v[i].x=a->x;v[i].y=a->y;v[i].z=a->z;v[i].rhw=a->rhw;
         v[i].color[0]=(uint8_t)(a->diffuse>>16);v[i].color[1]=(uint8_t)(a->diffuse>>8);v[i].color[2]=(uint8_t)a->diffuse;v[i].color[3]=(uint8_t)(a->diffuse>>24);
         v[i].u=a->u/(b->texture&&b->texture->width?b->texture->width:1);v[i].v=a->v/(b->texture&&b->texture->height?b->texture->height:1);}
@@ -193,7 +203,7 @@ static void backend_draw(const Nv2aSurface *s,const Nv2aBatch *b)
     glVertexAttribPointer(2,2,GL_FLOAT,GL_FALSE,sizeof *v,(void*)offsetof(GpuVertex,u));
     glDrawArrays(GL_TRIANGLES,0,(GLsizei)b->count);
     if(s_draw_calls<4){GLenum e=glGetError();if(e!=GL_NO_ERROR)fprintf(stderr,"[NV2A-GL] draw GL error 0x%04X\n",e);}
-    s_draw_calls++;free(v);
+    s_draw_calls++;
 }
 
 static void backend_flip(void) { if(make_current())glFlush(); }
@@ -254,5 +264,6 @@ void nv2a_gl_backend_shutdown(void)
     if(s_vao)glDeleteVertexArrays(1,&s_vao);
     if(s_program)glDeleteProgram(s_program);
     free(s_readback);
+    free(s_vertices);s_vertices=NULL;s_vertex_capacity=0;
     SDL_GL_DeleteContext(s_context);SDL_DestroyWindow(s_window);s_context=NULL;s_window=NULL;
 }
