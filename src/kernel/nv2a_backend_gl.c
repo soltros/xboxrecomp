@@ -317,7 +317,10 @@ static void backend_sync(uint32_t surface_va)
         return;
     }
     s=&t->s;if(!s->color_va || !s->width || !s->height)return;
-    glBindFramebuffer(GL_FRAMEBUFFER,t->fbo);glFinish();need=(size_t)s->width*s->height*4;
+    /* glReadPixels from client memory is itself ordered after prior draws and
+     * waits for this FBO's results. An explicit glFinish here forced a second
+     * full-pipeline wait on every guest flip and made frame pacing spiky. */
+    glBindFramebuffer(GL_FRAMEBUFFER,t->fbo);need=(size_t)s->width*s->height*4;
     if(need>s_readback_size){uint8_t *p=(uint8_t*)realloc(s_readback,need);if(!p)return;s_readback=p;s_readback_size=need;}
     glPixelStorei(GL_PACK_ALIGNMENT,1);glReadPixels(0,0,(GLsizei)s->width,(GLsizei)s->height,GL_BGRA,GL_UNSIGNED_BYTE,s_readback);
     if(seq<=8 || seq%120==0){
