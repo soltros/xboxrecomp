@@ -1724,49 +1724,76 @@ static void raster_triangle(const float a[2], const float b[2],
         return;
     }
 
-    for (y = miny; y < maxy; y++) {
-        for (x = minx; x < maxx; x++) {
-            float px = (float)x + 0.5f, py = (float)y + 0.5f;
-            float w0 = (b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0]);
-            float w1 = (c[0] - b[0]) * (py - b[1]) - (c[1] - b[1]) * (px - b[0]);
-            float w2 = (a[0] - c[0]) * (py - c[1]) - (a[1] - c[1]) * (px - c[0]);
-            if (!((w0 >= 0 && w1 >= 0 && w2 >= 0)
-               || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
-                continue;
-            if (textured) {
-                /* Barycentric, straight from the edge functions already
-                 * computed: w1 is the area opposite a, w2 opposite b, w0
-                 * opposite c, and the three sum to the whole triangle.
-                 *
-                 * No perspective divide. These are screen-space vertices with
-                 * no w to divide by -- which is exactly the case a full-screen
-                 * pass is, and the only case that reaches here. */
-                uint32_t texel;
-                float su = (w1 * uv[0][0] + w2 * uv[1][0] + w0 * uv[2][0]) / area;
-                float sv = (w1 * uv[0][1] + w2 * uv[1][1] + w0 * uv[2][1]) / area;
-                if (bilinear) {
-                    /* Filtered: a negative coordinate is a tap off the edge
-                     * and must reach sample_tex's addressing, not be clamped. */
-                    uint32_t acc[4] = {0, 0, 0, 0}, i;
-                    for (i = 0; i < taps; i++)
-                        if (!bilinear_accum(su + tap_start[0] + (float)i * tap_step[0],
-                                            sv + tap_start[1] + (float)i * tap_step[1], acc))
-                            break;
-                    if (i == taps) {
-                        put_pixel(mem, bpp, x, y, filter_result(acc, taps));
+    {
+        /* Edge functions are affine in x and y. Start each row once and add
+         * their constant x/y gradients instead of doing six multiplies for
+         * every pixel. The old per-pixel form dominated the framebuffer
+         * renderer on geometry-heavy titles such as UC2 (tens of thousands
+         * of triangles per frame). */
+        const float e0x = -(b[1] - a[1]), e0y = b[0] - a[0];
+        const float e1x = -(c[1] - b[1]), e1y = c[0] - b[0];
+        const float e2x = -(a[1] - c[1]), e2y = a[0] - c[0];
+        const float px0 = (float)minx + 0.5f;
+        float py = (float)miny + 0.5f;
+        float row_w0 = (b[0] - a[0]) * (py - a[1])
+                     - (b[1] - a[1]) * (px0 - a[0]);
+        float row_w1 = (c[0] - b[0]) * (py - b[1])
+                     - (c[1] - b[1]) * (px0 - b[0]);
+        float row_w2 = (a[0] - c[0]) * (py - c[1])
+                     - (a[1] - c[1]) * (px0 - c[0]);
+
+        for (y = miny; y < maxy; y++) {
+            float w0, w1, w2;
+            for (x = minx, w0 = row_w0, w1 = row_w1, w2 = row_w2;
+                 x < maxx; x++, w0 += e0x, w1 += e1x, w2 += e2x) {
+                if (!((w0 >= 0 && w1 >= 0 && w2 >= 0)
+                   || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
+                    continue;
+                if (textured) {
+                    /* Barycentric, straight from the edge functions already
+                     * computed: w1 is the area opposite a, w2 opposite b, w0
+                     * opposite c, and the three sum to the whole triangle.
+                     *
+                     * No perspective divide. These are screen-space vertices
+                     * with no w to divide by -- which is exactly the case a
+                     * full-screen pass is, and the only case that reaches
+                     * here. */
+                    uint32_t texel;
+                    float su = (w1 * uv[0][0] + w2 * uv[1][0]
+                              + w0 * uv[2][0]) / area;
+                    float sv = (w1 * uv[0][1] + w2 * uv[1][1]
+                              + w0 * uv[2][1]) / area;
+                    if (bilinear) {
+                        /* Filtered: a negative coordinate is a tap off the
+                         * edge and must reach sample_tex's addressing, not
+                         * be clamped. */
+                        uint32_t acc[4] = {0, 0, 0, 0}, i;
+                        for (i = 0; i < taps; i++)
+                            if (!bilinear_accum(
+                                    su + tap_start[0] + (float)i * tap_step[0],
+                                    sv + tap_start[1] + (float)i * tap_step[1],
+                                    acc))
+                                break;
+                        if (i == taps) {
+                            put_pixel(mem, bpp, x, y, filter_result(acc, taps));
+                            continue;
+                        }
+                        put_pixel(mem, bpp, x, y, argb);
                         continue;
                     }
-                    put_pixel(mem, bpp, x, y, argb);
-                    continue;
+                    if (su < 0.0f) su = 0.0f;
+                    if (sv < 0.0f) sv = 0.0f;
+                    if (sample_texture((uint32_t)su, (uint32_t)sv, &texel)) {
+                        put_pixel(mem, bpp, x, y, texel);
+                        continue;
+                    }
                 }
-                if (su < 0.0f) su = 0.0f;
-                if (sv < 0.0f) sv = 0.0f;
-                if (sample_texture((uint32_t)su, (uint32_t)sv, &texel)) {
-                    put_pixel(mem, bpp, x, y, texel);
-                    continue;
-                }
+                put_pixel(mem, bpp, x, y, argb);
             }
-            put_pixel(mem, bpp, x, y, argb);
+            row_w0 += e0y;
+            row_w1 += e1y;
+            row_w2 += e2y;
+            py += 1.0f;
         }
     }
     s_gpu.tris_drawn++;
