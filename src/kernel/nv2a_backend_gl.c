@@ -19,6 +19,11 @@
 typedef struct { Nv2aSurface s; GLuint fbo, color, depth; uint64_t used; } Target;
 typedef struct { Nv2aTexture key; GLuint name; } CachedTexture;
 typedef struct { float x,y,z,rhw; uint8_t color[4],specular[4]; float tc[4][3]; } GpuVertex;
+typedef struct {
+    uint64_t seq;
+    uint32_t surface, count, diffuse, tex0, tex1, stage, color_mask;
+    uint8_t combiner, alpha_test, blend, depth;
+} DrawTrace;
 
 static SDL_Window *s_window;
 static SDL_GLContext s_context;
@@ -30,6 +35,7 @@ static GLint s_tex_samplers[4],s_tex_enabled[4];
 static Target s_targets[TARGET_CACHE];
 static uint64_t s_target_clock;
 static uint64_t s_draw_calls, s_sync_calls;
+static DrawTrace s_draw_trace[8];
 static CachedTexture s_textures[TEX_CACHE];
 static unsigned s_next_texture;
 static GpuVertex *s_vertices;
@@ -302,6 +308,16 @@ static void backend_draw(const Nv2aSurface *s,const Nv2aBatch *b)
     for(i=0;i<4;i++)glVertexAttribPointer(3+i,3,GL_FLOAT,GL_FALSE,sizeof *v,(void*)offsetof(GpuVertex,tc)+i*sizeof v[0].tc[0]);
     glDrawArrays(GL_TRIANGLES,0,(GLsizei)b->count);
     if(s_draw_calls<16){GLenum e=glGetError();if(e!=GL_NO_ERROR)fprintf(stderr,"[NV2A-GL] draw GL error 0x%04X\n",e);}
+    {
+        DrawTrace *d=&s_draw_trace[s_draw_calls%8];
+        d->seq=s_draw_calls; d->surface=s->color_va; d->count=b->count;
+        d->diffuse=b->vertices[0].diffuse;
+        d->tex0=b->textures[0]?b->textures[0]->offset:0;
+        d->tex1=b->textures[1]?b->textures[1]->offset:0;
+        d->stage=r->combiner.stage_program; d->color_mask=r->color_mask;
+        d->combiner=r->combiner_enable; d->alpha_test=r->alpha_test_enable;
+        d->blend=r->blend_enable; d->depth=r->depth_test_enable;
+    }
     s_draw_calls++;
 }
 
@@ -329,6 +345,18 @@ static void backend_sync(uint32_t surface_va)
         fprintf(stderr,"[NV2A-GL] sync %llu surface=0x%08X %ux%u nonblack=%llu/%llu GL=0x%04X\n",
                 (unsigned long long)seq,surface_va,s->width,s->height,
                 (unsigned long long)nz,(unsigned long long)((size_t)s->width*s->height),e);
+        if(seq>=120 && nz==0){
+            uint64_t first=s_draw_calls>8?s_draw_calls-8:0, n;
+            fprintf(stderr,"[NV2A-GL] black-frame draw trace (%llu total draws):\n",
+                    (unsigned long long)s_draw_calls);
+            for(n=first;n<s_draw_calls;n++){
+                const DrawTrace *d=&s_draw_trace[n%8];
+                if(d->seq==n)fprintf(stderr,"[NV2A-GL]   draw %llu surface=%08X verts=%u rgba=%08X tex=%08X/%08X stage=%08X rc=%u alpha=%u blend=%u depth=%u mask=%08X\n",
+                    (unsigned long long)d->seq,d->surface,d->count,d->diffuse,
+                    d->tex0,d->tex1,d->stage,d->combiner,d->alpha_test,
+                    d->blend,d->depth,d->color_mask);
+            }
+        }
     }
     dst=(uint8_t*)((uintptr_t)xbox_GetMemoryOffset()+s->color_va);
     if(s->bytes_per_pixel==4){for(y=0;y<s->height;y++)memcpy(dst+(size_t)y*s->pitch,s_readback+(size_t)y*s->width*4,(size_t)s->width*4);}
