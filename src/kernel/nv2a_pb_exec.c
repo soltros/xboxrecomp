@@ -4937,16 +4937,17 @@ void nv2a_pb_exec_report(void)
     int i, j;
 
     {
-        /* Frames per second of guest time, from flips between reports. */
+        /* Wall-clock frames per second from guest flips between reports. */
         static uint32_t last_flips;
-        static unsigned long last_ms;
-        unsigned long now = (unsigned long)(clock() * 1000.0 / CLOCKS_PER_SEC);
-        if (last_ms && now > last_ms)
+        static uint64_t last_ns;
+        uint64_t now = xbox_HostNowNs();
+        if (last_ns && now > last_ns)
             fprintf(stderr, "[GPU] %.2f fps (%u flips)%c",
-                    (s_gpu.flips - last_flips) * 1000.0 / (now - last_ms),
+                    (double)(s_gpu.flips - last_flips) * 1000000000.0
+                        / (double)(now - last_ns),
                     s_gpu.flips, 10);
         last_flips = s_gpu.flips;
-        last_ms = now;
+        last_ns = now;
     }
     flip_hold_report();
     fprintf(stderr, "[GPU] surface 0x%08X pitch %u clip %ux%u+%u+%u"
