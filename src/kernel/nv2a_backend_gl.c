@@ -374,9 +374,14 @@ static void backend_sync(uint32_t surface_va)
     if(!s_owns_window){
         int w=0,h=0;SDL_GL_GetDrawableSize(s_window,&w,&h);
         if(w>0&&h>0){
+            /* The NV2A screen-space Y coordinate has its origin at the top,
+             * while OpenGL's framebuffer origin is at the bottom. Flip the
+             * source Y endpoints to match the guest-memory scanout. Also
+             * restore state the preceding guest draw may have left behind. */
+            glDisable(GL_SCISSOR_TEST);glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
             glBindFramebuffer(GL_READ_FRAMEBUFFER,t->fbo);glReadBuffer(GL_COLOR_ATTACHMENT0);
             glBindFramebuffer(GL_DRAW_FRAMEBUFFER,0);glDrawBuffer(GL_BACK);
-            glBlitFramebuffer(0,0,(GLint)s->width,(GLint)s->height,0,0,w,h,GL_COLOR_BUFFER_BIT,GL_NEAREST);
+            glBlitFramebuffer(0,(GLint)s->height,(GLint)s->width,0,0,0,w,h,GL_COLOR_BUFFER_BIT,GL_NEAREST);
             SDL_GL_SwapWindow(s_window);
         }
     }
