@@ -2663,14 +2663,23 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
     const float *a = T->a, *b = T->b, *c = T->c;
     const Nv2aVshOutput *va = T->va, *vb = T->vb, *vc = T->vc;
     int x, y, k, bilinear, aniso;
+    const float e0x = -(b[1] - a[1]), e0y = b[0] - a[0];
+    const float e1x = -(c[1] - b[1]), e1y = c[0] - b[0];
+    const float e2x = -(a[1] - c[1]), e2y = a[0] - c[0];
+    const float px0 = (float)T->minx + 0.5f;
+    float py = (float)y0 + 0.5f;
+    float row_w0 = (b[0] - a[0]) * (py - a[1])
+                 - (b[1] - a[1]) * (px0 - a[0]);
+    float row_w1 = (c[0] - b[0]) * (py - b[1])
+                 - (c[1] - b[1]) * (px0 - b[0]);
+    float row_w2 = (a[0] - c[0]) * (py - c[1])
+                 - (a[1] - c[1]) * (px0 - c[0]);
 
     tex_filter_config(&bilinear, &aniso);
     for (y = y0; y < T->maxy; y += step) {
-        for (x = T->minx; x < T->maxx; x++) {
-            float px = (float)x + 0.5f, py = (float)y + 0.5f;
-            float w0 = (b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0]);
-            float w1 = (c[0] - b[0]) * (py - b[1]) - (c[1] - b[1]) * (px - b[0]);
-            float w2 = (a[0] - c[0]) * (py - c[1]) - (a[1] - c[1]) * (px - c[0]);
+        float w0, w1, w2;
+        for (x = T->minx, w0 = row_w0, w1 = row_w1, w2 = row_w2;
+             x < T->maxx; x++, w0 += e0x, w1 += e1x, w2 += e2x) {
             float l0, l1, l2, z, col[4], pw;
             uint32_t argb;
             if (!((w0 >= 0 && w1 >= 0 && w2 >= 0)
@@ -2771,6 +2780,9 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
             }
             put_pixel(T->mem, T->bpp, x, y, argb);
         }
+        row_w0 += e0y * (float)step;
+        row_w1 += e1y * (float)step;
+        row_w2 += e2y * (float)step;
     }
 }
 
