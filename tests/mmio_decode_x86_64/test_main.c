@@ -63,6 +63,26 @@ int main(void)
     CHECK("F7 TEST sets ZF and clears CF/OF",
           (uc.uc_mcontext.gregs[REG_EFL] & 0x841) == 0x40);
 
+    /* OHCI status polling emits AND r32, [base + index] on POSIX. */
+    {
+        const uint8_t and_sib[] = { 0x23, 0x1C, 0x01 };
+        reset(&uc, and_sib);
+        device.value = 0x80000000u;
+        uc.uc_mcontext.gregs[REG_RBX] = (greg_t)0xABCDEF12FFFFFFFFULL;
+        uc.uc_mcontext.gregs[REG_EFL] = 0x841; /* OF, ZF, CF */
+        CHECK("AND r32, [base+index] handled", mmio_emulate_x86_64(
+            &uc, 0x000C, NULL, read_device, write_device));
+        CHECK("AND advances over ModRM and SIB",
+              MMIO_CTX_PC(&uc) == (uintptr_t)and_sib + sizeof and_sib);
+        CHECK("AND reads once without writing the device",
+              device.reads == 1 && device.writes == 0
+              && device.off == 0x000C && device.size == 4);
+        CHECK("AND writes the result with 32-bit zero extension",
+              uc.uc_mcontext.gregs[REG_RBX] == (greg_t)0x80000000u);
+        CHECK("AND updates ZF/SF and clears CF/OF",
+              (uc.uc_mcontext.gregs[REG_EFL] & 0x8C1) == 0x80);
+    }
+
     /* TEST's sign flag follows the operand width for the byte form. */
     {
         const uint8_t test_byte[] = { 0xF6, 0x00, 0x80 };

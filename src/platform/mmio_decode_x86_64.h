@@ -14,7 +14,7 @@
  * not to reconstruct the effective address. RIP-relative mod=00 rm=101 is
  * decoded with its disp32, so its length is right too.
  *
- * Covered forms: MOV 88/89 8A/8B, MOV moffs A0-A3, MOVZX 0F B6/B7, MOVSX
+ * Covered forms: MOV 88/89 8A/8B, AND 23, MOV moffs A0-A3, MOVZX 0F B6/B7, MOVSX
  * 0F BE/BF, MOV r/m,imm C6/C7, TEST r/m,imm F6/F7 /0 and /1, MOVD/MOVQ
  * 0F 6E/7E between XMM and r/m, and
  * MOVUPS/MOVAPS 0F 10/11 (four dword accesses). Anything else returns 0 and
@@ -331,6 +331,21 @@ static inline int mmio_emulate_x86_64(mmio_ctx_t *uc, uint32_t off, void *dev,
             goto undecoded;
         v = rd(dev, off, size);
         mmio_x86_write_operand_reg(uc, reg, v, size, has_rex);
+        MMIO_CTX_SET_PC(uc, MMIO_CTX_PC(uc) + prefix + 1 + mlen);
+        return 1;
+    }
+
+    case 0x23: {                                /* AND r, r/m     (load) */
+        uint64_t lhs;
+
+        mlen = mmio_x86_modrm(op + 1, rex_r, rex_b,
+                              &mod, &reg, &rm, &rip_rel);
+        if (mod == 3)
+            goto undecoded;
+        lhs = mmio_x86_read_operand_reg(uc, reg, size, has_rex);
+        v = rd(dev, off, size);
+        mmio_x86_test_flags(uc, lhs, v, size);
+        mmio_x86_write_operand_reg(uc, reg, lhs & v, size, has_rex);
         MMIO_CTX_SET_PC(uc, MMIO_CTX_PC(uc) + prefix + 1 + mlen);
         return 1;
     }
