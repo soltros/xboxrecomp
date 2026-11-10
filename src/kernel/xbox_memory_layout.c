@@ -3639,6 +3639,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     if (g_win_window_size)
         win_settle_placeholders();
 #endif
+    /* The optional OHCI model traps its two register blocks in the MCPX
+     * aperture. Initialize it only after the aperture and guest address
+     * translation are in place; without RECOMP_USB it remains a no-op. */
+    xbox_OhciInit();
     xbox_WatchInit();
     fprintf(stderr, "xbox_MemoryLayoutInit: complete\n");
     return TRUE;
