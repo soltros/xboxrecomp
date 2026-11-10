@@ -28,6 +28,7 @@
 #define NV2A_BACKEND_H
 
 #include <stdint.h>
+#include "nv2a_combiner.h"
 
 /* The colour surface being drawn into, in real (anti-aliased) pixels.
  * aa_sx/aa_sy give the anti-aliasing factor, so width/aa_sx is the logical
@@ -58,6 +59,9 @@ typedef struct {
     float    rhw;               /* 1/w, 1 for pre-transformed batches */
     uint32_t diffuse;           /* 0xAARRGGBB */
     float    u, v;              /* texels */
+    uint32_t specular;          /* 0xAARRGGBB: secondary vertex colour */
+    float    u1, v1, u2, v2, u3, v3; /* texel coordinates for stages 1..3 */
+    float    q0, q1, q2, q3;    /* projective divisor per texture stage */
 } Nv2aVertex;
 
 /* Render state as the title set it, in NV2A's own (OpenGL) enum values:
@@ -80,12 +84,15 @@ typedef struct {
      * that ignores these draws that pass over the whole surface. */
     uint32_t stencil_enable, stencil_func, stencil_ref, stencil_func_mask;
     uint32_t stencil_write_mask, stencil_fail, stencil_zfail, stencil_zpass;
+    uint32_t combiner_enable, clip_plane_mode;
+    Nv2aCombiner combiner;
 } Nv2aRenderState;
 
 typedef struct {
     const Nv2aVertex  *vertices;    /* triangle list: count is a multiple of 3 */
     uint32_t           count;
     const Nv2aTexture *texture;     /* NULL: untextured */
+    const Nv2aTexture *textures[4]; /* register-combiner texture stages */
     const Nv2aRenderState *state;
 } Nv2aBatch;
 

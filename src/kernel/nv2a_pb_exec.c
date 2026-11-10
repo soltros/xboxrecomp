@@ -853,6 +853,9 @@ static void current_render_state(Nv2aRenderState *r)
     r->stencil_fail      = s_reg[0x0370 / 4];        /* SET_STENCIL_OP_FAIL */
     r->stencil_zfail     = s_reg[0x0374 / 4];        /* SET_STENCIL_OP_ZFAIL */
     r->stencil_zpass     = s_reg[0x0378 / 4];        /* SET_STENCIL_OP_ZPASS */
+    r->combiner_enable   = s_gpu.rc_seen;
+    r->clip_plane_mode   = s_gpu.clip_plane_mode;
+    r->combiner          = s_gpu.rc;
 }
 
 static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);
@@ -2211,19 +2214,22 @@ static Nv2aVertex *backend_slot(void)
 
 static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
 {
-    float su = 1.0f, sv = 1.0f;
-
-    if (tex_size_from_format(s_gpu.texs[0].color)) {
-        su = (float)s_gpu.texs[0].width;
-        sv = (float)s_gpu.texs[0].height;
-    }
+    int st;
     o->x = v->pos[0];
     o->y = v->pos[1];
     o->z = v->pos[2];
     o->rhw = 1.0f / v->pos[3];
     o->diffuse = pack_color(v->d0);
-    o->u = v->tex[0][0] * su;
-    o->v = v->tex[0][1] * sv;
+    o->specular = pack_color(v->d1);
+    for(st=0;st<4;st++){
+        float su=tex_size_from_format(s_gpu.texs[st].color)?(float)s_gpu.texs[st].width:1.0f;
+        float sv=tex_size_from_format(s_gpu.texs[st].color)?(float)s_gpu.texs[st].height:1.0f;
+        float u=v->tex[st][0]*su, tv=v->tex[st][1]*sv, q=v->tex[st][3];
+        if(st==0){o->u=u;o->v=tv;o->q0=q;}
+        else if(st==1){o->u1=u;o->v1=tv;o->q1=q;}
+        else if(st==2){o->u2=u;o->v2=tv;o->q2=q;}
+        else{o->u3=u;o->v3=tv;o->q3=q;}
+    }
 }
 
 /* `textured`: the batch carried texture coordinates, so the bound texture is
@@ -2232,7 +2238,7 @@ static void backend_flush(int textured)
 {
     Nv2aSurface surf;
     Nv2aRenderState rs;
-    Nv2aTexture tex;
+    Nv2aTexture tex[4];
     Nv2aBatch batch;
 
     if (!s_bcount)
@@ -2242,18 +2248,18 @@ static void backend_flush(int textured)
     batch.vertices = s_bverts;
     batch.count = s_bcount;
     batch.texture = NULL;
+    memset(batch.textures, 0, sizeof batch.textures);
     batch.state = &rs;
-    if (textured && s_gpu.texs[0].valid) {
-        tex.offset = s_gpu.texs[0].offset;
-        tex.width  = s_gpu.texs[0].width;
-        tex.height = s_gpu.texs[0].height;
-        tex.pitch  = s_gpu.texs[0].pitch;
-        tex.color  = s_gpu.texs[0].color;
-        tex.addr_u = s_gpu.texs[0].addr_u;
-        tex.addr_v = s_gpu.texs[0].addr_v;
-        tex.levels = s_gpu.texs[0].pitch ? 1 : s_gpu.texs[0].levels;
-        tex.filter = s_gpu.texs[0].filter;
-        batch.texture = &tex;
+    {
+        int st;
+        for(st=0;st<4;st++)if(s_gpu.texs[st].valid){
+            tex[st].offset=s_gpu.texs[st].offset;tex[st].width=s_gpu.texs[st].width;
+            tex[st].height=s_gpu.texs[st].height;tex[st].pitch=s_gpu.texs[st].pitch;
+            tex[st].color=s_gpu.texs[st].color;tex[st].addr_u=s_gpu.texs[st].addr_u;
+            tex[st].addr_v=s_gpu.texs[st].addr_v;tex[st].levels=s_gpu.texs[st].pitch?1:s_gpu.texs[st].levels;
+            tex[st].filter=s_gpu.texs[st].filter;batch.textures[st]=&tex[st];
+        }
+        if(textured)batch.texture=batch.textures[0];
     }
     s_backend->draw(&surf, &batch);
     s_gpu.tris_drawn += s_bcount / 3;
