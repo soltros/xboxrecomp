@@ -783,12 +783,22 @@ static void surface_apply_clip(void)
 
 static const Nv2aBackend *s_backend;
 static void (*s_backend_present_sync)(void);
+static void (*s_backend_surface_sync)(uint32_t surface_va);
 
 void nv2a_backend_register_with_present_sync(const Nv2aBackend *backend,
                                              void (*present_sync)(void))
 {
     s_backend = backend;
     s_backend_present_sync = backend ? present_sync : NULL;
+    s_backend_surface_sync = NULL;
+}
+
+void nv2a_backend_register_with_surface_sync(const Nv2aBackend *backend,
+                                             void (*present_sync)(uint32_t))
+{
+    s_backend = backend;
+    s_backend_present_sync = NULL;
+    s_backend_surface_sync = backend ? present_sync : NULL;
 }
 
 void nv2a_backend_register(const Nv2aBackend *backend)
@@ -4577,6 +4587,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
                                                 : s_gpu.pitch;
             if (done) {
+                if (s_backend_surface_sync)
+                    s_backend_surface_sync(dma_resolve(done));
                 xbox_FramebufferWindowSet(dma_resolve(done), pitch);
                 xbox_FramebufferWindowSetAA(s_gpu.aa_sy > 1.5f ? 2 : 1);
                 xbox_FramebufferWindowPresent(dma_resolve(done), pitch);

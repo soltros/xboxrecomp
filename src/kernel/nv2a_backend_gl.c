@@ -14,8 +14,9 @@
 #include <string.h>
 
 #define TEX_CACHE 128
+#define TARGET_CACHE 16
 
-typedef struct { Nv2aSurface s; GLuint fbo, color, depth; } Target;
+typedef struct { Nv2aSurface s; GLuint fbo, color, depth; uint64_t used; } Target;
 typedef struct { Nv2aTexture key; GLuint name; } CachedTexture;
 typedef struct { float x,y,z,rhw; uint8_t color[4]; float u,v; } GpuVertex;
 
@@ -23,7 +24,9 @@ static SDL_Window *s_window;
 static SDL_GLContext s_context;
 static GLuint s_program, s_vao, s_vbo;
 static GLint s_size, s_sampler, s_use_texture, s_alpha_enable, s_alpha_func, s_alpha_ref;
-static Target s_target;
+static Target s_targets[TARGET_CACHE];
+static Target *s_active_target;
+static uint64_t s_target_clock;
 static CachedTexture s_textures[TEX_CACHE];
 static unsigned s_next_texture;
 static uint8_t *s_readback;
@@ -75,22 +78,45 @@ static GLuint compile_shader(GLenum type, const char *src)
     return sh;
 }
 
-static int ensure_target(const Nv2aSurface *s)
+static Target *target_for_va(uint32_t va)
 {
-    if(s_target.fbo && s_target.s.color_va==s->color_va && s_target.s.width==s->width
-       && s_target.s.height==s->height) return 1;
-    if(s_target.fbo){ glDeleteFramebuffers(1,&s_target.fbo); glDeleteTextures(1,&s_target.color); glDeleteRenderbuffers(1,&s_target.depth); }
-    memset(&s_target,0,sizeof s_target); s_target.s=*s;
-    glGenTextures(1,&s_target.color); glBindTexture(GL_TEXTURE_2D,s_target.color);
+    unsigned i;
+    for(i=0;i<TARGET_CACHE;i++)
+        if(s_targets[i].fbo && s_targets[i].s.color_va==va)
+            return &s_targets[i];
+    return NULL;
+}
+
+static void destroy_target(Target *t)
+{
+    if(t->fbo)glDeleteFramebuffers(1,&t->fbo);
+    if(t->color)glDeleteTextures(1,&t->color);
+    if(t->depth)glDeleteRenderbuffers(1,&t->depth);
+    memset(t,0,sizeof *t);
+}
+
+static Target *ensure_target(const Nv2aSurface *s)
+{
+    unsigned i,slot=0;uint64_t oldest=UINT64_MAX;Target *t=target_for_va(s->color_va);
+    if(t && t->s.width==s->width && t->s.height==s->height && t->s.pitch==s->pitch){
+        t->used=++s_target_clock;s_active_target=t;return t;
+    }
+    if(t)destroy_target(t);
+    for(i=0;i<TARGET_CACHE;i++){
+        if(!s_targets[i].fbo){slot=i;oldest=0;break;}
+        if(s_targets[i].used<oldest){oldest=s_targets[i].used;slot=i;}
+    }
+    t=&s_targets[slot];destroy_target(t);t->s=*s;t->used=++s_target_clock;
+    glGenTextures(1,&t->color); glBindTexture(GL_TEXTURE_2D,t->color);
     glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,(GLsizei)s->width,(GLsizei)s->height,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST); glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
-    glGenFramebuffers(1,&s_target.fbo); glBindFramebuffer(GL_FRAMEBUFFER,s_target.fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,s_target.color,0);
-    glGenRenderbuffers(1,&s_target.depth); glBindRenderbuffer(GL_RENDERBUFFER,s_target.depth);
+    glGenFramebuffers(1,&t->fbo); glBindFramebuffer(GL_FRAMEBUFFER,t->fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,t->color,0);
+    glGenRenderbuffers(1,&t->depth); glBindRenderbuffer(GL_RENDERBUFFER,t->depth);
     glRenderbufferStorage(GL_RENDERBUFFER,GL_DEPTH24_STENCIL8,(GLsizei)s->width,(GLsizei)s->height);
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER,GL_DEPTH_STENCIL_ATTACHMENT,GL_RENDERBUFFER,s_target.depth);
-    if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE){ fprintf(stderr,"[NV2A-GL] framebuffer setup failed\n"); return 0; }
-    return 1;
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER,GL_DEPTH_STENCIL_ATTACHMENT,GL_RENDERBUFFER,t->depth);
+    if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE){ fprintf(stderr,"[NV2A-GL] framebuffer setup failed for 0x%08X\n",s->color_va); destroy_target(t);return NULL; }
+    s_active_target=t;return t;
 }
 
 static int same_tex(const Nv2aTexture *a,const Nv2aTexture *b)
@@ -100,6 +126,15 @@ static GLuint texture_for(const Nv2aTexture *t)
 {
     uint32_t i; GLuint n; uint32_t *px;
     if(!t || !t->width || !t->height || (uint64_t)t->width*t->height>16777216u) return 0;
+    {
+        Target *rt=target_for_va(t->offset);
+        if(rt){rt->used=++s_target_clock;glBindTexture(GL_TEXTURE_2D,rt->color);
+            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,(t->filter&0x00ff0000u)?GL_LINEAR:GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,t->addr_u==3?GL_CLAMP_TO_EDGE:GL_REPEAT);
+            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,t->addr_v==3?GL_CLAMP_TO_EDGE:GL_REPEAT);
+            return rt->color;}
+    }
     for(i=0;i<TEX_CACHE;i++) if(s_textures[i].name && same_tex(&s_textures[i].key,t)) return s_textures[i].name;
     px=(uint32_t*)malloc((size_t)t->width*t->height*sizeof *px); if(!px)return 0;
     if(!nv2a_backend_decode_texture(t,px)){free(px);return 0;}
@@ -117,7 +152,9 @@ static GLuint texture_for(const Nv2aTexture *t)
 
 static void backend_clear(const Nv2aSurface *s,const Nv2aRenderState *rs,uint32_t flags,uint32_t argb,uint32_t zs)
 {
-    (void)rs; if(!make_current() || !ensure_target(s))return; glBindFramebuffer(GL_FRAMEBUFFER,s_target.fbo); glViewport(0,0,(GLsizei)s->width,(GLsizei)s->height);
+    Target *t;
+    (void)rs; if(!make_current() || !(t=ensure_target(s)))return; glBindFramebuffer(GL_FRAMEBUFFER,t->fbo); glViewport(0,0,(GLsizei)s->width,(GLsizei)s->height);
+    glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);glDepthMask(GL_TRUE);glStencilMask(0xff);glDisable(GL_SCISSOR_TEST);
     GLbitfield bits=0;
     if(flags&0xf0){glClearColor(((argb>>16)&255)/255.f,((argb>>8)&255)/255.f,(argb&255)/255.f,((argb>>24)&255)/255.f);bits|=GL_COLOR_BUFFER_BIT;}
     if(flags&1){glClearDepth(((zs>>8)&0xffffffu)/16777215.0);bits|=GL_DEPTH_BUFFER_BIT;}
@@ -127,14 +164,14 @@ static void backend_clear(const Nv2aSurface *s,const Nv2aRenderState *rs,uint32_
 
 static void backend_draw(const Nv2aSurface *s,const Nv2aBatch *b)
 {
-    uint32_t i; GpuVertex *v; GLuint tex=0; const Nv2aRenderState *r=b->state;
-    if(!b->count || !make_current() || !ensure_target(s))return;
+    uint32_t i; GpuVertex *v; GLuint tex=0; const Nv2aRenderState *r=b->state;Target *t;
+    if(!b->count || !make_current() || !(t=ensure_target(s)))return;
     v=(GpuVertex*)malloc((size_t)b->count*sizeof *v); if(!v)return;
     for(i=0;i<b->count;i++){const Nv2aVertex *a=&b->vertices[i]; v[i].x=a->x;v[i].y=a->y;v[i].z=a->z;v[i].rhw=a->rhw;
         v[i].color[0]=(uint8_t)(a->diffuse>>16);v[i].color[1]=(uint8_t)(a->diffuse>>8);v[i].color[2]=(uint8_t)a->diffuse;v[i].color[3]=(uint8_t)(a->diffuse>>24);
         v[i].u=a->u/(b->texture&&b->texture->width?b->texture->width:1);v[i].v=a->v/(b->texture&&b->texture->height?b->texture->height:1);}
     if(b->texture)tex=texture_for(b->texture);
-    glBindFramebuffer(GL_FRAMEBUFFER,s_target.fbo);glViewport(0,0,(GLsizei)s->width,(GLsizei)s->height);glUseProgram(s_program);glBindVertexArray(s_vao);
+    glBindFramebuffer(GL_FRAMEBUFFER,t->fbo);glViewport(0,0,(GLsizei)s->width,(GLsizei)s->height);glUseProgram(s_program);glBindVertexArray(s_vao);
     glEnableVertexAttribArray(0);glEnableVertexAttribArray(1);glEnableVertexAttribArray(2);
     glUniform2f(s_size,(float)s->width,(float)s->height);glUniform1i(s_sampler,0);glUniform1i(s_use_texture,tex?1:0);
     glUniform1i(s_alpha_enable,r->alpha_test_enable?1:0);glUniform1i(s_alpha_func,(GLint)r->alpha_func);glUniform1f(s_alpha_ref,r->alpha_ref/255.f);
@@ -153,11 +190,12 @@ static void backend_draw(const Nv2aSurface *s,const Nv2aBatch *b)
 
 static void backend_flip(void) { if(make_current())glFlush(); }
 
-static void backend_sync(void)
+static void backend_sync(uint32_t surface_va)
 {
-    size_t need; uint32_t y; uint8_t *dst; const Nv2aSurface *s=&s_target.s;
-    if(!make_current() || !s_target.fbo || !s->color_va || !s->width || !s->height)return;
-    glBindFramebuffer(GL_FRAMEBUFFER,s_target.fbo);glFinish();need=(size_t)s->width*s->height*4;
+    size_t need; uint32_t y; uint8_t *dst; Target *t;const Nv2aSurface *s;
+    if(!make_current() || !(t=target_for_va(surface_va)))return;
+    s=&t->s;if(!s->color_va || !s->width || !s->height)return;
+    glBindFramebuffer(GL_FRAMEBUFFER,t->fbo);glFinish();need=(size_t)s->width*s->height*4;
     if(need>s_readback_size){uint8_t *p=(uint8_t*)realloc(s_readback,need);if(!p)return;s_readback=p;s_readback_size=need;}
     glPixelStorei(GL_PACK_ALIGNMENT,1);glReadPixels(0,0,(GLsizei)s->width,(GLsizei)s->height,GL_BGRA,GL_UNSIGNED_BYTE,s_readback);
     dst=(uint8_t*)((uintptr_t)xbox_GetMemoryOffset()+s->color_va);
@@ -180,7 +218,7 @@ int nv2a_gl_backend_init(void)
     vs=compile_shader(GL_VERTEX_SHADER,vs_src);fs=compile_shader(GL_FRAGMENT_SHADER,fs_src);if(!vs||!fs)return 0;
     s_program=glCreateProgram();glAttachShader(s_program,vs);glAttachShader(s_program,fs);glLinkProgram(s_program);glGetProgramiv(s_program,GL_LINK_STATUS,&ok);glDeleteShader(vs);glDeleteShader(fs);if(!ok){fprintf(stderr,"[NV2A-GL] shader link failed\n");return 0;}
     s_size=glGetUniformLocation(s_program,"u_size");s_sampler=glGetUniformLocation(s_program,"u_tex");s_use_texture=glGetUniformLocation(s_program,"u_use_texture");s_alpha_enable=glGetUniformLocation(s_program,"u_alpha_enable");s_alpha_func=glGetUniformLocation(s_program,"u_alpha_func");s_alpha_ref=glGetUniformLocation(s_program,"u_alpha_ref");
-    glGenVertexArrays(1,&s_vao);glGenBuffers(1,&s_vbo);nv2a_backend_register_with_present_sync(&backend,backend_sync);
+    glGenVertexArrays(1,&s_vao);glGenBuffers(1,&s_vbo);nv2a_backend_register_with_surface_sync(&backend,backend_sync);
     /* Leave it unowned; the executor thread will bind it on its first call. */
     SDL_GL_MakeCurrent(s_window,NULL);
     return 1;
@@ -191,9 +229,7 @@ void nv2a_gl_backend_shutdown(void)
     unsigned i;nv2a_backend_register(NULL);if(!s_context)return;
     if(SDL_GL_GetCurrentContext()!=s_context && SDL_GL_MakeCurrent(s_window,s_context)!=0)return;
     for(i=0;i<TEX_CACHE;i++)if(s_textures[i].name)glDeleteTextures(1,&s_textures[i].name);
-    if(s_target.fbo)glDeleteFramebuffers(1,&s_target.fbo);
-    if(s_target.color)glDeleteTextures(1,&s_target.color);
-    if(s_target.depth)glDeleteRenderbuffers(1,&s_target.depth);
+    for(i=0;i<TARGET_CACHE;i++)destroy_target(&s_targets[i]);
     if(s_vbo)glDeleteBuffers(1,&s_vbo);
     if(s_vao)glDeleteVertexArrays(1,&s_vao);
     if(s_program)glDeleteProgram(s_program);

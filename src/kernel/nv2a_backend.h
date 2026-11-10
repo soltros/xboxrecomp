@@ -112,6 +112,11 @@ void nv2a_backend_register(const Nv2aBackend *backend);
 void nv2a_backend_register_with_present_sync(const Nv2aBackend *backend,
                                              void (*present_sync)(void));
 
+/* Like the above, but pass the finished surface VA to the synchronizer. This
+ * is required by renderers that keep multiple GPU render targets alive. */
+void nv2a_backend_register_with_surface_sync(const Nv2aBackend *backend,
+                                             void (*present_sync)(uint32_t surface_va));
+
 /* Decode a whole texture to 0xAARRGGBB, row-major, width*height entries.
  * Handles every format the executor can sample (swizzled, linear, DXT).
  * Returns 0 if the format is not supported. */
