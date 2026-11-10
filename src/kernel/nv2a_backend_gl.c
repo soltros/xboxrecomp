@@ -22,7 +22,8 @@ typedef struct { float x,y,z,rhw; uint8_t color[4],specular[4]; float tc[4][3]; 
 typedef struct {
     uint64_t seq;
     uint32_t surface, count, diffuse, tex0, tex1, stage, color_mask;
-    uint8_t combiner, alpha_test, blend, depth;
+    float min_x, max_x, min_y, max_y;
+    uint8_t combiner, alpha_test, blend, depth, cull, cull_face, front_face;
 } DrawTrace;
 
 static SDL_Window *s_window;
@@ -256,6 +257,7 @@ static void backend_clear(const Nv2aSurface *s,const Nv2aRenderState *rs,uint32_
 static void backend_draw(const Nv2aSurface *s,const Nv2aBatch *b)
 {
     uint32_t i; GpuVertex *v; GLuint tex[4]={0}; const Nv2aRenderState *r=b->state;Target *t;
+    float min_x=0.0f,max_x=0.0f,min_y=0.0f,max_y=0.0f;
     if(!b->count || !make_current() || !(t=ensure_target(s)))return;
     if((size_t)b->count>s_vertex_capacity){
         size_t cap=s_vertex_capacity?s_vertex_capacity:256;
@@ -266,6 +268,8 @@ static void backend_draw(const Nv2aSurface *s,const Nv2aBatch *b)
     }
     v=s_vertices;
     for(i=0;i<b->count;i++){const Nv2aVertex *a=&b->vertices[i]; v[i].x=a->x;v[i].y=a->y;v[i].z=a->z;v[i].rhw=a->rhw;
+        if(i==0){min_x=max_x=a->x;min_y=max_y=a->y;}
+        else{if(a->x<min_x)min_x=a->x;if(a->x>max_x)max_x=a->x;if(a->y<min_y)min_y=a->y;if(a->y>max_y)max_y=a->y;}
         v[i].color[0]=(uint8_t)(a->diffuse>>16);v[i].color[1]=(uint8_t)(a->diffuse>>8);v[i].color[2]=(uint8_t)a->diffuse;v[i].color[3]=(uint8_t)(a->diffuse>>24);
         v[i].specular[0]=(uint8_t)(a->specular>>16);v[i].specular[1]=(uint8_t)(a->specular>>8);v[i].specular[2]=(uint8_t)a->specular;v[i].specular[3]=(uint8_t)(a->specular>>24);
         {const float uv[4][2]={{a->u,a->v},{a->u1,a->v1},{a->u2,a->v2},{a->u3,a->v3}};const float q[4]={a->q0,a->q1,a->q2,a->q3};int st;
@@ -315,8 +319,10 @@ static void backend_draw(const Nv2aSurface *s,const Nv2aBatch *b)
         d->tex0=b->textures[0]?b->textures[0]->offset:0;
         d->tex1=b->textures[1]?b->textures[1]->offset:0;
         d->stage=r->combiner.stage_program; d->color_mask=r->color_mask;
+        d->min_x=min_x;d->max_x=max_x;d->min_y=min_y;d->max_y=max_y;
         d->combiner=r->combiner_enable; d->alpha_test=r->alpha_test_enable;
         d->blend=r->blend_enable; d->depth=r->depth_test_enable;
+        d->cull=r->cull_enable;d->cull_face=(uint8_t)r->cull_face;d->front_face=(uint8_t)r->front_face;
     }
     s_draw_calls++;
 }
@@ -351,10 +357,11 @@ static void backend_sync(uint32_t surface_va)
                     (unsigned long long)s_draw_calls);
             for(n=first;n<s_draw_calls;n++){
                 const DrawTrace *d=&s_draw_trace[n%8];
-                if(d->seq==n)fprintf(stderr,"[NV2A-GL]   draw %llu surface=%08X verts=%u rgba=%08X tex=%08X/%08X stage=%08X rc=%u alpha=%u blend=%u depth=%u mask=%08X\n",
-                    (unsigned long long)d->seq,d->surface,d->count,d->diffuse,
+                if(d->seq==n)fprintf(stderr,"[NV2A-GL]   draw %llu surface=%08X verts=%u xy=%.2f..%.2f/%.2f..%.2f rgba=%08X tex=%08X/%08X stage=%08X rc=%u alpha=%u blend=%u depth=%u cull=%u:%02X/%02X mask=%08X\n",
+                    (unsigned long long)d->seq,d->surface,d->count,
+                    d->min_x,d->max_x,d->min_y,d->max_y,d->diffuse,
                     d->tex0,d->tex1,d->stage,d->combiner,d->alpha_test,
-                    d->blend,d->depth,d->color_mask);
+                    d->blend,d->depth,d->cull,d->cull_face,d->front_face,d->color_mask);
             }
         }
     }
