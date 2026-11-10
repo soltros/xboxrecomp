@@ -29,6 +29,23 @@ static unsigned s_next_texture;
 static uint8_t *s_readback;
 static size_t s_readback_size;
 
+/* The pushbuffer scanner owns the GL work thread, not boot_and_run(). SDL
+ * contexts are thread-affine, so bind the context when a renderer callback is
+ * entered instead of assuming startup's thread will also issue the draws. */
+static int make_current(void)
+{
+    if (!s_context || !s_window)
+        return 0;
+    if (SDL_GL_GetCurrentContext() == s_context)
+        return 1;
+    if (SDL_GL_MakeCurrent(s_window, s_context) != 0) {
+        fprintf(stderr, "[NV2A-GL] cannot activate OpenGL on render thread: %s\n",
+                SDL_GetError());
+        return 0;
+    }
+    return 1;
+}
+
 static const char *vs_src =
     "#version 330 core\n"
     "layout(location=0) in vec4 a_pos; layout(location=1) in vec4 a_color;"
@@ -100,7 +117,7 @@ static GLuint texture_for(const Nv2aTexture *t)
 
 static void backend_clear(const Nv2aSurface *s,const Nv2aRenderState *rs,uint32_t flags,uint32_t argb,uint32_t zs)
 {
-    (void)rs; if(!ensure_target(s))return; glBindFramebuffer(GL_FRAMEBUFFER,s_target.fbo); glViewport(0,0,(GLsizei)s->width,(GLsizei)s->height);
+    (void)rs; if(!make_current() || !ensure_target(s))return; glBindFramebuffer(GL_FRAMEBUFFER,s_target.fbo); glViewport(0,0,(GLsizei)s->width,(GLsizei)s->height);
     GLbitfield bits=0;
     if(flags&0xf0){glClearColor(((argb>>16)&255)/255.f,((argb>>8)&255)/255.f,(argb&255)/255.f,((argb>>24)&255)/255.f);bits|=GL_COLOR_BUFFER_BIT;}
     if(flags&1){glClearDepth(((zs>>8)&0xffffffu)/16777215.0);bits|=GL_DEPTH_BUFFER_BIT;}
@@ -111,7 +128,7 @@ static void backend_clear(const Nv2aSurface *s,const Nv2aRenderState *rs,uint32_
 static void backend_draw(const Nv2aSurface *s,const Nv2aBatch *b)
 {
     uint32_t i; GpuVertex *v; GLuint tex=0; const Nv2aRenderState *r=b->state;
-    if(!b->count || !ensure_target(s))return;
+    if(!b->count || !make_current() || !ensure_target(s))return;
     v=(GpuVertex*)malloc((size_t)b->count*sizeof *v); if(!v)return;
     for(i=0;i<b->count;i++){const Nv2aVertex *a=&b->vertices[i]; v[i].x=a->x;v[i].y=a->y;v[i].z=a->z;v[i].rhw=a->rhw;
         v[i].color[0]=(uint8_t)(a->diffuse>>16);v[i].color[1]=(uint8_t)(a->diffuse>>8);v[i].color[2]=(uint8_t)a->diffuse;v[i].color[3]=(uint8_t)(a->diffuse>>24);
@@ -133,12 +150,12 @@ static void backend_draw(const Nv2aSurface *s,const Nv2aBatch *b)
     glDrawArrays(GL_TRIANGLES,0,(GLsizei)b->count);free(v);
 }
 
-static void backend_flip(void) { glFlush(); }
+static void backend_flip(void) { if(make_current())glFlush(); }
 
 static void backend_sync(void)
 {
     size_t need; uint32_t y; uint8_t *dst; const Nv2aSurface *s=&s_target.s;
-    if(!s_target.fbo || !s->color_va || !s->width || !s->height)return;
+    if(!make_current() || !s_target.fbo || !s->color_va || !s->width || !s->height)return;
     glBindFramebuffer(GL_FRAMEBUFFER,s_target.fbo);glFinish();need=(size_t)s->width*s->height*4;
     if(need>s_readback_size){uint8_t *p=(uint8_t*)realloc(s_readback,need);if(!p)return;s_readback=p;s_readback_size=need;}
     glPixelStorei(GL_PACK_ALIGNMENT,1);glReadPixels(0,0,(GLsizei)s->width,(GLsizei)s->height,GL_BGRA,GL_UNSIGNED_BYTE,s_readback);
@@ -162,12 +179,16 @@ int nv2a_gl_backend_init(void)
     vs=compile_shader(GL_VERTEX_SHADER,vs_src);fs=compile_shader(GL_FRAGMENT_SHADER,fs_src);if(!vs||!fs)return 0;
     s_program=glCreateProgram();glAttachShader(s_program,vs);glAttachShader(s_program,fs);glLinkProgram(s_program);glGetProgramiv(s_program,GL_LINK_STATUS,&ok);glDeleteShader(vs);glDeleteShader(fs);if(!ok){fprintf(stderr,"[NV2A-GL] shader link failed\n");return 0;}
     s_size=glGetUniformLocation(s_program,"u_size");s_sampler=glGetUniformLocation(s_program,"u_tex");s_use_texture=glGetUniformLocation(s_program,"u_use_texture");s_alpha_enable=glGetUniformLocation(s_program,"u_alpha_enable");s_alpha_func=glGetUniformLocation(s_program,"u_alpha_func");s_alpha_ref=glGetUniformLocation(s_program,"u_alpha_ref");
-    glGenVertexArrays(1,&s_vao);glGenBuffers(1,&s_vbo);nv2a_backend_register_with_present_sync(&backend,backend_sync);return 1;
+    glGenVertexArrays(1,&s_vao);glGenBuffers(1,&s_vbo);nv2a_backend_register_with_present_sync(&backend,backend_sync);
+    /* Leave it unowned; the executor thread will bind it on its first call. */
+    SDL_GL_MakeCurrent(s_window,NULL);
+    return 1;
 }
 
 void nv2a_gl_backend_shutdown(void)
 {
-    unsigned i;nv2a_backend_register(NULL);if(!s_context)return;SDL_GL_MakeCurrent(s_window,s_context);
+    unsigned i;nv2a_backend_register(NULL);if(!s_context)return;
+    if(SDL_GL_GetCurrentContext()!=s_context && SDL_GL_MakeCurrent(s_window,s_context)!=0)return;
     for(i=0;i<TEX_CACHE;i++)if(s_textures[i].name)glDeleteTextures(1,&s_textures[i].name);
     if(s_target.fbo)glDeleteFramebuffers(1,&s_target.fbo);
     if(s_target.color)glDeleteTextures(1,&s_target.color);
