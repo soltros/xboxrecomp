@@ -178,7 +178,31 @@ static Target *ensure_target(const Nv2aSurface *s)
 }
 
 static int same_tex(const Nv2aTexture *a,const Nv2aTexture *b)
-{ return a->offset==b->offset && a->width==b->width && a->height==b->height && a->color==b->color && a->pitch==b->pitch; }
+{ return a->offset==b->offset && a->width==b->width && a->height==b->height
+      && a->color==b->color && a->pitch==b->pitch && a->levels==b->levels
+      && a->filter==b->filter && a->addr_u==b->addr_u && a->addr_v==b->addr_v; }
+
+/* XMV and other streaming surfaces can rewrite a linear full-frame texture at
+ * the same guest VA every frame. A normal immutable-texture cache silently
+ * freezes the first frame (often the black frame before the decoder starts).
+ * Update this one common framebuffer format directly from guest memory; the
+ * pixels stay GPU-rendered and avoid a per-pixel CPU decode. */
+static void refresh_streaming_frame(const Nv2aTexture *t, GLuint name)
+{
+    GLint old_row_length;
+    const void *pixels;
+    if(t->color!=0x12 || t->width!=640 || t->height!=480
+       || t->pitch<t->width*4 || (t->pitch&3))return;
+    pixels=(const void*)((uintptr_t)xbox_GetMemoryOffset()+t->offset);
+    glBindTexture(GL_TEXTURE_2D,name);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER,0);
+    glGetIntegerv(GL_UNPACK_ROW_LENGTH,&old_row_length);
+    glPixelStorei(GL_UNPACK_ALIGNMENT,4);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH,(GLint)(t->pitch/4));
+    glTexSubImage2D(GL_TEXTURE_2D,0,0,0,(GLsizei)t->width,(GLsizei)t->height,
+                    GL_BGRA,GL_UNSIGNED_BYTE,pixels);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH,old_row_length);
+}
 
 static GLuint texture_for(const Nv2aTexture *t)
 {
@@ -193,7 +217,10 @@ static GLuint texture_for(const Nv2aTexture *t)
             glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,t->addr_v==3?GL_CLAMP_TO_EDGE:GL_REPEAT);
             return rt->color;}
     }
-    for(i=0;i<TEX_CACHE;i++) if(s_textures[i].name && same_tex(&s_textures[i].key,t)) return s_textures[i].name;
+    for(i=0;i<TEX_CACHE;i++) if(s_textures[i].name && same_tex(&s_textures[i].key,t)){
+        refresh_streaming_frame(t,s_textures[i].name);
+        return s_textures[i].name;
+    }
     px=(uint32_t*)malloc((size_t)t->width*t->height*sizeof *px); if(!px)return 0;
     if(!nv2a_backend_decode_texture(t,px)){free(px);return 0;}
     glGenTextures(1,&n); glBindTexture(GL_TEXTURE_2D,n);
