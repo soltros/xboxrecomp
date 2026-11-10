@@ -26,7 +26,7 @@ static GLuint s_program, s_vao, s_vbo;
 static GLint s_size, s_alpha_enable, s_alpha_func, s_alpha_ref;
 static GLint s_rc_enable,s_rc_ci,s_rc_ai,s_rc_co,s_rc_ao,s_rc_f0,s_rc_f1;
 static GLint s_rc_final0,s_rc_final1,s_rc_finalc0,s_rc_finalc1,s_rc_control,s_rc_stage,s_rc_clip;
-static GLint s_tex_samplers[4],s_tex_enabled;
+static GLint s_tex_samplers[4],s_tex_enabled[4];
 static Target s_targets[TARGET_CACHE];
 static uint64_t s_target_clock;
 static uint64_t s_draw_calls, s_sync_calls;
@@ -82,6 +82,9 @@ static const char *fs_src =
     "float mo(float x,uint m){if(m==8u)return x-0.5;if(m==16u)return x*2.0;"
     "if(m==24u)return (x-0.5)*2.0;if(m==32u)return x*4.0;if(m==48u)return x*0.5;return x;}"
     "vec4 unpackc(uint c){return vec4(float((c>>16u)&255u),float((c>>8u)&255u),float(c&255u),float(c>>24u))/255.0;}"
+    "vec4 sample_stage(int i,vec2 uv){if(i==0)return texture(u_tex[0],uv);"
+    "if(i==1)return texture(u_tex[1],uv);if(i==2)return texture(u_tex[2],uv);"
+    "return texture(u_tex[3],uv); }"
     "vec3 rr(uint b,vec4 R[16]){vec4 r=R[int(b&15u)];vec3 x=((b&16u)!=0u)?vec3(r.a):r.rgb;"
     "return vec3(mi(x.r,b),mi(x.g,b),mi(x.b,b));}"
     "float ra(uint b,vec4 R[16]){vec4 r=R[int(b&15u)];return mi(((b&16u)!=0u)?r.a:r.b,b);}"
@@ -115,7 +118,7 @@ static const char *fs_src =
     "void main(){vec3 tc[4]=vec3[4](v_tc0,v_tc1,v_tc2,v_tc3);vec4 T[4];"
     "for(int i=0;i<4;i++){uint mode=(u_stage>>(uint(i)*5u))&31u;"
     "if(mode==0u)T[i]=vec4(0,0,0,1);else if(mode==4u)T[i]=clamp(vec4(tc[i].xy,0,1),0,1);"
-    "else if(u_tex_enabled[i]!=0)T[i]=texture(u_tex[i],tc[i].xy/(abs(tc[i].z)>0.000001?tc[i].z:1.0));"
+    "else if(u_tex_enabled[i]!=0)T[i]=sample_stage(i,tc[i].xy/(abs(tc[i].z)>0.000001?tc[i].z:1.0));"
     "else T[i]=vec4(1);if(mode==5u){T[i]=vec4(0);for(int j=0;j<4;j++){bool ge=((u_clip>>(uint(i)*4u+uint(j)))&1u)!=0u;float c=j<2?tc[i][j]:0.0;if(ge?c<0.0:c>=0.0)discard;}}}"
     "vec4 c=v_color;if(u_rc_enable!=0)c=comb(v_color,v_specular,T);else if(u_tex_enabled[0]!=0)c*=T[0];"
     " if(u_alpha_enable!=0){bool pass=false;"
@@ -246,7 +249,7 @@ static void backend_draw(const Nv2aSurface *s,const Nv2aBatch *b)
     for(i=0;i<7;i++)glEnableVertexAttribArray(i);
     glUniform2f(s_size,(float)s->width,(float)s->height);
     glUniform1i(s_alpha_enable,r->alpha_test_enable?1:0);glUniform1i(s_alpha_func,(GLint)r->alpha_func);glUniform1f(s_alpha_ref,r->alpha_ref/255.f);
-    for(i=0;i<4;i++){glActiveTexture(GL_TEXTURE0+i);glBindTexture(GL_TEXTURE_2D,tex[i]);glUniform1i(s_tex_samplers[i],(GLint)i);glUniform1i(s_tex_enabled+i,tex[i]?1:0);}
+    for(i=0;i<4;i++){glActiveTexture(GL_TEXTURE0+i);glBindTexture(GL_TEXTURE_2D,tex[i]);glUniform1i(s_tex_samplers[i],(GLint)i);glUniform1i(s_tex_enabled[i],tex[i]?1:0);}
     glUniform1i(s_rc_enable,r->combiner_enable?1:0);
     {const Nv2aCombiner *c=&r->combiner;glUniform1uiv(s_rc_ci,8,c->color_icw);glUniform1uiv(s_rc_ai,8,c->alpha_icw);glUniform1uiv(s_rc_co,8,c->color_ocw);glUniform1uiv(s_rc_ao,8,c->alpha_ocw);glUniform1uiv(s_rc_f0,8,c->factor0);glUniform1uiv(s_rc_f1,8,c->factor1);
      glUniform1ui(s_rc_final0,c->final0);glUniform1ui(s_rc_final1,c->final1);glUniform1ui(s_rc_finalc0,c->final_c0);glUniform1ui(s_rc_finalc1,c->final_c1);glUniform1ui(s_rc_control,c->control);glUniform1ui(s_rc_stage,c->stage_program);glUniform1ui(s_rc_clip,r->clip_plane_mode);}
@@ -309,7 +312,7 @@ int nv2a_gl_backend_init(void)
     s_size=glGetUniformLocation(s_program,"u_size");s_alpha_enable=glGetUniformLocation(s_program,"u_alpha_enable");s_alpha_func=glGetUniformLocation(s_program,"u_alpha_func");s_alpha_ref=glGetUniformLocation(s_program,"u_alpha_ref");
     s_rc_enable=glGetUniformLocation(s_program,"u_rc_enable");s_rc_ci=glGetUniformLocation(s_program,"u_ci[0]");s_rc_ai=glGetUniformLocation(s_program,"u_ai[0]");s_rc_co=glGetUniformLocation(s_program,"u_co[0]");s_rc_ao=glGetUniformLocation(s_program,"u_ao[0]");s_rc_f0=glGetUniformLocation(s_program,"u_f0[0]");s_rc_f1=glGetUniformLocation(s_program,"u_f1[0]");
     s_rc_final0=glGetUniformLocation(s_program,"u_final0");s_rc_final1=glGetUniformLocation(s_program,"u_final1");s_rc_finalc0=glGetUniformLocation(s_program,"u_finalc0");s_rc_finalc1=glGetUniformLocation(s_program,"u_finalc1");s_rc_control=glGetUniformLocation(s_program,"u_control");s_rc_stage=glGetUniformLocation(s_program,"u_stage");s_rc_clip=glGetUniformLocation(s_program,"u_clip");
-    for(int i=0;i<4;i++){char name[32];snprintf(name,sizeof name,"u_tex[%d]",i);s_tex_samplers[i]=glGetUniformLocation(s_program,name);snprintf(name,sizeof name,"u_tex_enabled[%d]",i);s_tex_enabled=glGetUniformLocation(s_program,"u_tex_enabled[0]");}
+    for(int i=0;i<4;i++){char name[32];snprintf(name,sizeof name,"u_tex[%d]",i);s_tex_samplers[i]=glGetUniformLocation(s_program,name);snprintf(name,sizeof name,"u_tex_enabled[%d]",i);s_tex_enabled[i]=glGetUniformLocation(s_program,name);}
     glGenVertexArrays(1,&s_vao);glGenBuffers(1,&s_vbo);nv2a_backend_register_with_surface_sync(&backend,backend_sync);
     /* Leave it unowned; the executor thread will bind it on its first call. */
     SDL_GL_MakeCurrent(s_window,NULL);
