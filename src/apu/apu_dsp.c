@@ -25,6 +25,7 @@
 #include "apu_state.h"
 #include "fpconv.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -112,6 +113,26 @@ static int mcpx_apu_mixdown_all(void)
         on = (e && *e) ? (atoi(e) != 0) : 1;
     }
     return on;
+}
+
+static int mcpx_apu_dsp_soft_limit(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_DSP_SOFT_LIMIT");
+        on = e && *e && *e != '0';
+    }
+    return on;
+}
+
+static float mcpx_apu_soft_limit_sample(float x)
+{
+    const float knee = 0.85f;
+    float a = fabsf(x);
+    if (a <= knee)
+        return x;
+    return copysignf(knee + (1.0f - knee) *
+                     tanhf((a - knee) / (1.0f - knee)), x);
 }
 
 /* GPRST (GP region + 0xFFFC): the GP runs only with both reset bits set, as
@@ -247,6 +268,9 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
      */
 
     int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
+    static uint64_t stat_frames, stat_hard_clip, stat_limited;
+    static float stat_peak;
+    const int soft_limit = mcpx_apu_dsp_soft_limit();
 
     if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
@@ -289,6 +313,16 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
                 left = mixbins[0][i];
                 right = mixbins[1][i];
             }
+            if (fabsf(left) > stat_peak) stat_peak = fabsf(left);
+            if (fabsf(right) > stat_peak) stat_peak = fabsf(right);
+            if (fabsf(left) > 1.0f) stat_hard_clip++;
+            if (fabsf(right) > 1.0f) stat_hard_clip++;
+            if (soft_limit) {
+                if (fabsf(left) > 0.85f) stat_limited++;
+                if (fabsf(right) > 0.85f) stat_limited++;
+                left = mcpx_apu_soft_limit_sample(left);
+                right = mcpx_apu_soft_limit_sample(right);
+            }
             /* Clamp to [-1, 1] range */
             if (left > 1.0f) left = 1.0f;
             if (left < -1.0f) left = -1.0f;
@@ -299,6 +333,15 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
              * Each of the 8 sub-frames writes its own 32-sample slice. */
             d->monitor.frame_buf[off + i][0] = (int16_t)(left * 32767.0f);
             d->monitor.frame_buf[off + i][1] = (int16_t)(right * 32767.0f);
+        }
+        stat_frames += NUM_SAMPLES_PER_FRAME;
+        if (stat_frames >= 240000) {
+            fprintf(stderr, "[APU-MIX] dsp-limit=%s raw-peak=%.3f hard-clips=%llu soft-limited=%llu (5s)\n",
+                    soft_limit ? "on" : "off", stat_peak,
+                    (unsigned long long)stat_hard_clip,
+                    (unsigned long long)stat_limited);
+            stat_frames = stat_hard_clip = stat_limited = 0;
+            stat_peak = 0.0f;
         }
     }
 
